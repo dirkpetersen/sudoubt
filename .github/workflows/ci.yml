@@ -1,9 +1,9 @@
 # Build and test on every push and pull request, on x86_64 and arm64.
+# The root tests run the real binary as root against /storage/test.
 name: ci
 
 on:
   push:
-    branches: [main]
   pull_request:
 
 permissions:
@@ -25,3 +25,5 @@ jobs:
         run: cargo test --locked
       - name: Build
         run: cargo build --locked --release
+      - name: Root tests
+        run: sudo -E env "PATH=$PATH" cargo test --locked --test root -- --test-threads=1
