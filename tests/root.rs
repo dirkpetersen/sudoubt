@@ -358,6 +358,10 @@ fn write_calls_wait() {
         return;
     };
     fs::create_dir(&dir).unwrap();
+    // A fresh CI runner may have booted less than a minute ago.
+    while boot_ms() < 60_000 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
     // The last write call was 58 seconds ago, so this one waits about 2 seconds.
     fs::write(
         format!("{STATE}/state"),
