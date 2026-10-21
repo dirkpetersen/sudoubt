@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-sudoubt is "sudo with trust issues": a tiny Rust helper that the ProjectVault web app (`~/gh/project-folder-mgmt`, https://github.com/dirkpetersen/project-folder-mgmt) calls through sudo, so the web app does not need to run as root. README.md is the design spec. Keep README.md and the code in step.
+sudoubt is "sudo with trust issues": a tiny Rust helper that the ProjectVault web app calls through sudo, so the web app does not need to run as root. README.md is the design spec. Keep README.md and the code in step.
 
 ## Status
 

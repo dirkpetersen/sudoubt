@@ -6,7 +6,7 @@ sudo with trust issues. A tiny Rust helper that lets your web app create project
 
 ## Why
 
-[project-folder-mgmt](https://github.com/dirkpetersen/project-folder-mgmt) (ProjectVault) is a web app that lets researchers create and manage POSIX project folders. Today the app runs as root, because it must create folders, change owners and modes, and set ACLs.
+ProjectVault is a web app that lets researchers create and manage POSIX project folders. Today the app runs as root, because it must create folders, change owners and modes, and set ACLs.
 
 A web server that runs as root is a large risk. If an attacker breaks into the web app, the attacker has full root access to the host.
 
