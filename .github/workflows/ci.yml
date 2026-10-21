@@ -1,0 +1,27 @@
+# Build and test on every push and pull request, on x86_64 and arm64.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the Rust toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - name: Install libacl
+        run: sudo apt-get update && sudo apt-get install -y libacl1-dev
+      - name: Test
+        run: cargo test --locked
+      - name: Build
+        run: cargo build --locked --release

@@ -8,7 +8,15 @@ sudoubt is "sudo with trust issues": a tiny Rust helper that the ProjectVault we
 
 ## Status
 
-There is no code yet. There is no `Cargo.toml`, so there are no build, lint or test commands. When the crate exists, add the real commands here.
+The crate is a placeholder: `src/main.rs` only prints a "not implemented" JSON error and exits 1. It exists so the release pipeline works. It has no dependencies yet; `Cargo.lock` must be regenerated and committed when you add them.
+
+- Build: `cargo build` (release: `cargo build --release`)
+- Test: `cargo test`; one test: `cargo test <name>`
+- CI (`.github/workflows/ci.yml`) runs `cargo test --locked` and a release build on x86_64 and arm64 for every push to `main` and every pull request.
+
+The ACL crates link against libacl, so building needs its headers: `libacl1-dev` on Ubuntu (CI installs it), `libacl-devel` on RHEL.
+
+README marks the command syntax and the JSON output format as "not final". You may change them, but update README.md in the same change.
 
 ## Hard rules (from README)
 
@@ -33,19 +41,18 @@ These are the security model. Do not weaken them without the owner's approval.
 
 ## Release
 
-Push a tag `vX.Y.Z` that matches the `Cargo.toml` version. `.github/workflows/release.yml` builds Linux x86_64 and arm64 on native runners and publishes the release. The build uses `--locked`, so commit `Cargo.lock`. Pin every action to a commit SHA.
+Push a tag `vX.Y.Z` that matches the `Cargo.toml` version. `.github/workflows/release.yml` builds Linux x86_64 and arm64 on native runners and publishes the release. The build uses `--locked`, so commit `Cargo.lock`. Pin every action to a commit SHA. CI runs `cargo test --locked --release` on both architectures before it builds. The runners stay on `ubuntu-24.04` / `ubuntu-24.04-arm` (glibc 2.39) on purpose: a newer runner would link against a newer glibc than RHEL 10 has. `rust-toolchain.toml` pins the Rust version for local builds and both workflows (they run `rustup toolchain install`). To upgrade Rust, change it there and keep `rust-version` in `Cargo.toml` the same.
 
 ## Agent workflow
 
-Opus implements. Fable and Gemini review security. Reviewers only read and report; only the implementer edits code.
+Opus implements. Fable reviews security. Reviewers only read and report; only the implementer edits code.
+
+The Gemini review (`scripts/gemini-security-review.sh`) is paused. Do not run it until the owner turns it back on.
 
 1. **Implement (Opus).** Make the change and its tests. Run `cargo build` and `cargo test` until they pass.
-2. **Review (in parallel).** Start both reviewers at the same time:
-   - Fable: the `fable-security-reviewer` subagent (`.claude/agents/fable-security-reviewer.md`).
-   - Gemini: `scripts/gemini-security-review.sh`. It prints the path of the report in `reviews/`.
-   Both use the same prompt, `prompts/security-review.md`.
+2. **Review.** Run the `fable-security-reviewer` subagent (`.claude/agents/fable-security-reviewer.md`). It uses `prompts/security-review.md`.
 3. **Fix (Opus).** Fix every Critical and High finding. For Medium and Low, fix it or say why not. Before you fix a finding, check that it is real; reviewers can be wrong.
 4. **Repeat** steps 2 and 3 until no Critical or High findings are left.
-5. **Report** to the owner: what changed, what each reviewer found, what you fixed, and what you did not fix and why. If Fable and Gemini disagree on a finding, give both views and let the owner decide.
+5. **Report** to the owner: what changed, what the reviewer found, what you fixed, and what you did not fix and why.
 
 `reviews/` is in `.gitignore`. Do not commit review reports.

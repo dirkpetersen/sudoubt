@@ -1,0 +1,16 @@
+[package]
+name = "sudoubt"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.99"
+description = "sudo with trust issues: a tiny root helper for ProjectVault folder operations"
+license = "MIT"
+repository = "https://github.com/dirkpetersen/sudoubt"
+publish = false
+
+[dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

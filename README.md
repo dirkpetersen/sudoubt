@@ -2,7 +2,7 @@
 
 sudo with trust issues. A tiny Rust helper that lets your web app create project folders and set owners, ACLs and Ceph quotas, and refuses everything else.
 
-> **Status:** design stage. There is no code yet. This README describes the planned tool.
+> **Status:** design stage. The crate is a placeholder that does nothing yet. This README describes the planned tool.
 
 ## Why
 
@@ -240,7 +240,7 @@ If sudoubt gets a move operation, the plan is:
 
 ## Build
 
-The Rust crate does not exist yet. When it does, the normal Cargo commands apply:
+Use the normal Cargo commands. The ACL support needs the libacl headers (`libacl1-dev` on Ubuntu, `libacl-devel` on RHEL).
 
 ```bash
 cargo build --release
