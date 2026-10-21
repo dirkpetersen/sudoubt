@@ -98,8 +98,9 @@ Rules:
 - sudoubt checks all operations before it does the first one. If one operation is not allowed, sudoubt does none of them.
 - sudoubt always runs the operations in this fixed order, not in the order on the command line: mkdir, chown, chmod, setfacl, setfattr, getfacl, getfattr.
 - If an operation fails, sudoubt stops and does not run the operations after it.
-- `--mkdir` succeeds if the directory already exists. This makes it safe to repeat a call. It fails if the path exists but is not a directory, or is a symlink.
-- `--setfacl` accepts any ACL entry.
+- `--mkdir` creates only the last path component, like `mkdir` without `-p`. The parent must already exist (exit code 5). It succeeds if the directory already exists. This makes it safe to repeat a call. It fails if the path exists but is not a directory, or is a symlink.
+- `--chown` takes `user:group`. Each part is a name or a numeric ID. sudoubt looks up names (through NSS) and checks the resulting IDs, so a name that maps to a system account is refused like its ID.
+- `--setfacl` accepts any ACL entry and replaces the ACL, like `setfacl --set`. Access entries replace the whole access ACL. Default entries (`d:`) replace the whole default ACL. If the call has no entries of one kind, that ACL is not changed.
 - `--setfattr` and `--getfattr` work only on the Ceph quota attributes. See [Ceph quota](#ceph-quota).
 
 The command syntax is not final.
@@ -216,7 +217,7 @@ For codes 2, 3, 4, 6, 7 and 8 sudoubt did nothing. For code 5, the operations be
 
 sudoubt assumes that the caller is hostile. The design must stop a compromised web app from using sudoubt to get root.
 
-- **No shell, no external binaries.** sudoubt makes the system calls directly in Rust (`nix` for mkdir, chmod and chown, `posix-acl` or `exacl` for ACLs, `xattr` for extended attributes). It does not run `/bin/chown` or `setfacl`, so there is no argument injection and no `PATH` attack.
+- **No shell, no external binaries.** sudoubt makes the system calls directly in Rust (`nix` for mkdir, chmod and chown, `posix-acl` or `exacl` for ACLs, `xattr` for extended attributes, `serde_json` for the output). It does not run `/bin/chown` or `setfacl`, so there is no argument injection and no `PATH` attack.
 - **Compiled-in limits.** The allowed roots, the rate limits and the xattr allowlist are constants in the source. A caller cannot change them at run time.
 - **No symlink tricks.** sudoubt opens each path component with `openat` and `O_NOFOLLOW`, starting from the allowed root. A symlink placed inside a project folder cannot redirect a chown or setfacl to a file outside the root, such as `/etc/shadow`.
 - **Xattr allowlist.** sudoubt reads and writes only the two Ceph quota attributes, with integer values. It refuses all other names. This blocks `security.*` attributes, which hold SELinux labels and file capabilities, and `trusted.*` attributes, which only root can see.

@@ -29,15 +29,15 @@ These are the security model. Do not weaken them without the owner's approval.
 - Resolve paths from the allowed root with `openat` + `O_NOFOLLOW` on each component, so symlinks cannot redirect an operation.
 - One invocation = one path. It can have many operations, but each operation at most once (duplicate = exit 2). Validate all operations before running any. Run them in fixed order: mkdir, chown, chmod, setfacl, setfattr, getfacl, getfattr. Stop at the first failure.
 - Rate limit: `MAX_CALLS_PER_MINUTE` (default 1) and `MAX_WAITING` (default 25) are compiled-in constants, global for all callers. Only calls with a write operation count; read-only calls (getfacl, getfattr) skip the limit. State lives in `/run/sudoubt/` (root, `0700`), guarded by `flock`. When the limit is reached, print "please wait N seconds" to stderr, wait, then run. Each waiter holds a lock on one of `MAX_WAITING` slot files; no free slot = exit 8.
-- mkdir succeeds if the directory already exists. setfacl accepts any ACL entry.
-- chmod: refuse setuid; allow setgid on directories only. chown: refuse UIDs and GIDs 1 to 999; allow 0. xattr: only `ALLOWED_XATTRS` = `ceph.quota.max_bytes`, `ceph.quota.max_files`; value must be a decimal integer >= 0; directories only.
+- mkdir creates only the last component (no `-p`) and succeeds if the directory already exists. setfacl accepts any ACL entry and replaces the ACL like `setfacl --set` (access entries replace the access ACL, `d:` entries the default ACL; a kind not given stays as is).
+- chmod: refuse setuid; allow setgid on directories only. chown: `user:group`, names or numeric IDs; look up names, then refuse UIDs and GIDs 1 to 999; allow 0. xattr: only `ALLOWED_XATTRS` = `ceph.quota.max_bytes`, `ceph.quota.max_files`; value must be a decimal integer >= 0; directories only.
 - Move (archive into `.deleted`) is an open question. If added: only `renameat2` with `RENAME_NOREPLACE`, both paths inside the allowed roots, alone in its invocation. Never a delete operation.
 - Two install modes: sudo (default) and setuid root (`4750`, group with only the web server user). The binary must be safe in both: ignore all env vars, set its own umask, check effective UID 0. Never trust env in setuid mode.
 - sudoubt does not check the caller; the sudoers rule or the file mode does. Group management is out of scope (ProjectVault uses an API).
 - Output: pretty JSON to stdout always (also on failure, with `ok`, `exit_code`, `error`); plain text to stderr. Log one syslog line per call (caller, path, operations, result). Caller is `SUDO_USER` in sudo mode, real UID in setuid mode.
 - Exit codes: 0 success, 1 internal, 2 usage, 3 path refused, 4 operation refused, 5 file system error, 6 rate limit state error, 7 not root, 8 too many waiting. The table in README.md is the reference.
 - Targets: Linux x86_64 and arm64, RHEL 10+ and Ubuntu 26.04+.
-- Keep the tool small. Avoid dependencies beyond the ones above.
+- Keep the tool small. Avoid dependencies beyond the ones above plus `serde`/`serde_json` for the JSON output.
 
 ## Release
 
