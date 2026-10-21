@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-label="sudoubt: sudo with trust issues">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1e1b4b"/>
+      <stop offset="0.55" stop-color="#312e81"/>
+      <stop offset="1" stop-color="#0f766e"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#e2e8f0"/>
+    </linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0 H0 V32" fill="none" stroke="#ffffff" stroke-opacity="0.05" stroke-width="1"/>
+    </pattern>
+  </defs>
+  <rect width="1280" height="320" rx="24" fill="url(#bg)"/>
+  <rect width="1280" height="320" rx="24" fill="url(#grid)"/>
+  <g transform="translate(96 52)">
+    <path d="M108 0 L208 38 V114 C208 180 166 226 108 248 C50 226 8 180 8 114 V38 Z" fill="url(#shield)"/>
+    <path d="M76 88 C76 64 92 50 112 50 C134 50 148 66 148 85 C148 103 136 111 124 119 C114 126 112 132 112 144 V152"
+          fill="none" stroke="#312e81" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="112" cy="190" r="13" fill="#312e81"/>
+  </g>
+  <text x="380" y="150" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="96" font-weight="700" fill="#ffffff">sudoubt</text>
+  <text x="384" y="200" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, 'DejaVu Sans', sans-serif" font-size="32" fill="#c7d2fe">sudo with trust issues</text>
+  <rect x="380" y="228" width="800" height="48" rx="10" fill="#0b1020" fill-opacity="0.55"/>
+  <text x="400" y="260" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="22" fill="#5eead4">$ <tspan fill="#e2e8f0">sudo sudoubt /storage/test/proj --mkdir --chmod 2770</tspan></text>
+</svg>

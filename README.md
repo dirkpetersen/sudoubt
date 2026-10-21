@@ -1,4 +1,16 @@
-# sudoubt
+<p align="center">
+  <img src="assets/banner.svg" alt="sudoubt: sudo with trust issues" width="100%">
+</p>
+
+<p align="center">
+  <a href="https://github.com/dirkpetersen/sudoubt/actions/workflows/ci.yml"><img src="https://github.com/dirkpetersen/sudoubt/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/dirkpetersen/sudoubt/releases/latest"><img src="https://img.shields.io/github/v/release/dirkpetersen/sudoubt?sort=semver" alt="Release"></a>
+  <img src="https://img.shields.io/badge/platform-linux%20x86__64%20%7C%20arm64-informational" alt="Platform: Linux x86_64 and arm64">
+  <img src="https://img.shields.io/badge/rust-1.99-orange?logo=rust" alt="Rust 1.99">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT"></a>
+</p>
+
+# <img src="assets/icon.svg" alt="" width="36" height="36"> sudoubt
 
 sudo with trust issues. A tiny Rust helper that lets your web app create project folders and set their owners, modes, ACLs and Ceph quotas, and refuses everything else. It works on directories only.
 
