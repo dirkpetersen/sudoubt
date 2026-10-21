@@ -25,5 +25,8 @@ jobs:
         run: cargo test --locked
       - name: Build
         run: cargo build --locked --release
+      - name: Audit dependencies
+        if: matrix.runner == 'ubuntu-24.04'
+        run: cargo install --locked cargo-audit --version 0.22.2 && cargo audit
       - name: Root tests
         run: sudo -E env "PATH=$PATH" cargo test --locked --test root -- --test-threads=1

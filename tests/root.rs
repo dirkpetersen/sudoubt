@@ -101,7 +101,7 @@ fn create_project_folder() {
     );
     assert_eq!(
         o.json["results"]["getfacl"]["default"],
-        "d:u::rwx,d:g::rwx,d:o::---"
+        "d:u::rwx,d:g::rwx,d:m::rwx,d:o::---"
     );
 
     // Repeating the call is safe.
@@ -111,46 +111,87 @@ fn create_project_folder() {
 }
 
 #[test]
-fn file_operations() {
+fn files_are_refused() {
     let Some((_g, dir)) = setup("files") else {
         return;
     };
     fs::create_dir(&dir).unwrap();
     let f = format!("{dir}/file");
     fs::write(&f, "x").unwrap();
-    let o = run(&[
-        &f,
-        "--chown",
-        "1000:1000",
-        "--chmod",
-        "0640",
-        "--setfacl",
-        "u::rw,g::r,o::-,u:1001:r",
-    ]);
-    assert_eq!(o.code, 0, "{}", o.json);
-    let md = fs::metadata(&f).unwrap();
-    assert_eq!((md.uid(), md.gid()), (1000, 1000));
-    let o = run(&[&f, "--getfacl"]);
-    assert_eq!(
-        o.json["results"]["getfacl"]["access"],
-        "u::rw-,u:1001:r--,g::r--,m::r--,o::---"
-    );
-    assert_eq!(o.json["results"]["getfacl"]["default"], Value::Null);
-
-    // Refused on files, and nothing is done.
+    fs::set_permissions(&f, fs::Permissions::from_mode(0o644)).unwrap();
     for args in [
-        vec!["--chmod", "2770"],
-        vec!["--chown", "0:0", "--setfacl", "d:u::rwx,d:g::rwx,d:o::-"],
+        vec!["--chown", "1000:1000"],
+        vec!["--chmod", "0640"],
+        vec!["--setfacl", "u::rw,g::r,o::-"],
+        vec!["--getfacl"],
         vec!["--getfattr", "ceph.quota.max_bytes"],
-        vec!["--setfattr", "ceph.quota.max_bytes=1"],
+        vec!["--mkdir"],
     ] {
         let mut a = vec![f.as_str()];
         a.extend(args);
         let o = run(&a);
-        assert_eq!(o.code, 4, "{a:?} {}", o.json);
+        assert_eq!(o.code, 3, "{a:?} {}", o.json);
     }
-    assert_eq!(fs::metadata(&f).unwrap().uid(), 1000);
-    assert_eq!(run(&[&f, "--mkdir"]).code, 5);
+    let md = fs::metadata(&f).unwrap();
+    assert_eq!((md.uid(), mode(&f)), (0, 0o644));
+}
+
+#[test]
+fn remove_default_acl() {
+    let Some((_g, dir)) = setup("rmdefault") else {
+        return;
+    };
+    fs::create_dir(&dir).unwrap();
+    let o = run(&[&dir, "--setfacl", "d:u::rwx,d:g::rwx,d:o::-"]);
+    assert_eq!(o.code, 0, "{}", o.json);
+    let o = run(&[&dir, "--setfacl", "u::rwx,g::r-x,o::-,d:-"]);
+    assert_eq!(o.code, 0, "{}", o.json);
+    let o = run(&[&dir, "--getfacl"]);
+    assert_eq!(o.json["results"]["getfacl"]["default"], Value::Null);
+    assert_eq!(
+        o.json["results"]["getfacl"]["access"],
+        "u::rwx,g::r-x,m::r-x,o::---"
+    );
+    // Removing a default ACL that is not there is fine.
+    assert_eq!(run(&[&dir, "--setfacl", "d:-"]).code, 0);
+}
+
+#[test]
+fn symlinked_root_is_refused() {
+    let Some((_g, dir)) = setup("rootlink") else {
+        return;
+    };
+    fs::create_dir(&dir).unwrap();
+    let real = format!("{ROOT}-real");
+    let _ = fs::remove_dir_all(&real);
+    fs::rename(ROOT, &real).unwrap();
+    symlink(&real, ROOT).unwrap();
+    let o = run(&[&dir, "--chmod", "0777"]);
+    let mode_after = mode(&format!("{real}/rootlink"));
+    fs::remove_file(ROOT).unwrap();
+    fs::rename(&real, ROOT).unwrap();
+    assert_eq!(o.code, 3, "{}", o.json);
+    assert_ne!(mode_after, 0o777);
+}
+
+#[test]
+fn caller_limits_are_reset() {
+    let Some((_g, dir)) = setup("limits") else {
+        return;
+    };
+    fs::create_dir(&dir).unwrap();
+    // With a 1-byte file size limit the rate limit state could not be written.
+    let o = Command::new("prlimit")
+        .args(["--fsize=1", "--", BIN, &dir, "--chmod", "0750"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    assert_eq!(mode(&dir), 0o750);
 }
 
 #[test]
@@ -215,11 +256,14 @@ fn refused_operations() {
         vec!["--chown", "1:1000"],
         vec!["--chown", "1000:999"],
         vec!["--chown", "daemon:1000"],
+        vec!["--chown", "no-such-user-xyz:1000"],
+        vec!["--setfacl", "u::rwx,g::rwx,o::-,u:no-such-user-xyz:r"],
         vec!["--chown", "4294967295:1000"],
         vec!["--setfattr", "user.x=1"],
         vec!["--setfattr", "security.capability=1"],
         vec!["--setfattr", "ceph.quota.max_bytes=-1"],
         vec!["--getfattr", "trusted.x"],
+        vec!["--setfattr", "system.posix_acl_access=1"],
         // Checked before anything runs: the mkdir must not happen.
         vec!["--mkdir", "--chown", "0:0", "--chmod", "4777"],
     ] {
@@ -277,21 +321,19 @@ fn not_root() {
     let Some((_g, dir)) = setup("notroot") else {
         return;
     };
-    // The build directory may not be readable for nobody.
-    let bin = "/tmp/sudoubt-not-root-test";
-    fs::copy(BIN, bin).unwrap();
-    fs::set_permissions(bin, fs::Permissions::from_mode(0o755)).unwrap();
+    // The build directory may not be readable for nobody, so run a copy from
+    // a fresh private directory.
+    let tmp = nix::unistd::mkdtemp("/tmp/sudoubt-test-XXXXXX").unwrap();
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
+    let bin = tmp.join("sudoubt");
+    fs::copy(BIN, &bin).unwrap();
     let o = Command::new("setpriv")
-        .args([
-            "--reuid=65534",
-            "--regid=65534",
-            "--clear-groups",
-            bin,
-            &dir,
-            "--mkdir",
-        ])
+        .args(["--reuid=65534", "--regid=65534", "--clear-groups"])
+        .arg(&bin)
+        .args([&dir, "--mkdir"])
         .output()
         .unwrap();
+    fs::remove_dir_all(&tmp).unwrap();
     assert_eq!(o.status.code(), Some(7));
     assert!(!Path::new(&dir).exists());
 }

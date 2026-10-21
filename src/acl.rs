@@ -5,29 +5,52 @@
 //! Tags: `u`/`user`, `g`/`group`, `m`/`mask`, `o`/`other`. A `d:` or
 //! `default:` prefix marks a default ACL entry. The given entries replace the
 //! whole ACL of their kind, like `setfacl --set`. The mask is always
-//! recalculated.
+//! recalculated. The single entry `d:-` removes the default ACL.
+//!
+//! `parse` checks the syntax without looking up names. `resolve` looks up
+//! names and checks the result, after the rate limit.
 
 use posix_acl::{ACL_EXECUTE, ACL_READ, ACL_WRITE, PosixACL, Qualifier};
 
-use crate::request::{lookup_group, lookup_user};
+use crate::request::{Id, parse_id, resolve_group, resolve_user};
 use crate::{EXIT_OP, EXIT_USAGE, Fail, Result};
 
 const MAX_ENTRIES: usize = 64;
 
-/// Entries for the access ACL and the default ACL. An empty list means that
-/// ACL is left as it is.
+/// An entry tag as given, with names not yet looked up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Tag {
+    UserObj,
+    User(Id),
+    GroupObj,
+    Group(Id),
+    Mask,
+    Other,
+}
+
+/// The parsed spec: entries for the access and the default ACL. An empty
+/// list means that ACL is left as it is.
+#[derive(Debug, Default)]
+pub struct AclText {
+    pub access: Vec<(Tag, u32)>,
+    pub default: Vec<(Tag, u32)>,
+    pub remove_default: bool,
+}
+
+/// The resolved spec, ready to write.
 #[derive(Debug, Default)]
 pub struct AclSpec {
     pub access: Vec<(Qualifier, u32)>,
     pub default: Vec<(Qualifier, u32)>,
+    pub remove_default: bool,
 }
 
 fn usage(msg: impl Into<String>) -> Fail {
     Fail::new(EXIT_USAGE, msg)
 }
 
-pub fn parse(spec: &str) -> Result<AclSpec> {
-    let mut out = AclSpec::default();
+pub fn parse(spec: &str) -> Result<AclText> {
+    let mut out = AclText::default();
     let entries: Vec<&str> = spec.split(',').collect();
     if entries.len() > MAX_ENTRIES {
         return Err(usage(format!(
@@ -35,6 +58,13 @@ pub fn parse(spec: &str) -> Result<AclSpec> {
         )));
     }
     for entry in entries {
+        if entry == "d:-" || entry == "default:-" {
+            if out.remove_default {
+                return Err(usage(format!("ACL entry {entry:?} occurs more than once")));
+            }
+            out.remove_default = true;
+            continue;
+        }
         let mut parts: Vec<&str> = entry.split(':').collect();
         let default = matches!(parts.first(), Some(&"d") | Some(&"default"));
         if default {
@@ -45,13 +75,13 @@ pub fn parse(spec: &str) -> Result<AclSpec> {
                 "ACL entry {entry:?} must look like [d:]tag:qualifier:perms"
             )));
         };
-        let q = match (tag, qual) {
-            ("u" | "user", "") => Qualifier::UserObj,
-            ("g" | "group", "") => Qualifier::GroupObj,
-            ("m" | "mask", "") => Qualifier::Mask,
-            ("o" | "other", "") => Qualifier::Other,
-            ("u" | "user", name) => Qualifier::User(acl_id("user", lookup_user(name)?)?),
-            ("g" | "group", name) => Qualifier::Group(acl_id("group", lookup_group(name)?)?),
+        let t = match (tag, qual) {
+            ("u" | "user", "") => Tag::UserObj,
+            ("g" | "group", "") => Tag::GroupObj,
+            ("m" | "mask", "") => Tag::Mask,
+            ("o" | "other", "") => Tag::Other,
+            ("u" | "user", name) => Tag::User(acl_id(parse_id(name)?)?),
+            ("g" | "group", name) => Tag::Group(acl_id(parse_id(name)?)?),
             _ => return Err(usage(format!("bad ACL entry {entry:?}"))),
         };
         let list = if default {
@@ -59,23 +89,61 @@ pub fn parse(spec: &str) -> Result<AclSpec> {
         } else {
             &mut out.access
         };
-        if list.iter().any(|(x, _)| *x == q) {
+        if list.iter().any(|(x, _)| *x == t) {
             return Err(usage(format!("ACL entry {entry:?} occurs more than once")));
         }
-        list.push((
-            q,
-            parse_perm(perm).ok_or_else(|| usage(format!("bad permissions in {entry:?}")))?,
-        ));
+        let perm =
+            parse_perm(perm).ok_or_else(|| usage(format!("bad permissions in {entry:?}")))?;
+        list.push((t, perm));
+    }
+    if out.remove_default && !out.default.is_empty() {
+        return Err(usage("d:- cannot be combined with other default entries"));
     }
     for (name, list) in [("access", &out.access), ("default", &out.default)] {
         if list.is_empty() {
             continue;
         }
-        for base in [Qualifier::UserObj, Qualifier::GroupObj, Qualifier::Other] {
-            if !list.iter().any(|(q, _)| *q == base) {
+        for base in [Tag::UserObj, Tag::GroupObj, Tag::Other] {
+            if !list.iter().any(|(t, _)| *t == base) {
                 return Err(usage(format!(
                     "the {name} ACL needs u::, g:: and o:: entries"
                 )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Look up names and check that each ACL is valid.
+pub fn resolve(text: &AclText) -> Result<AclSpec> {
+    let conv = |list: &[(Tag, u32)]| -> Result<Vec<(Qualifier, u32)>> {
+        list.iter()
+            .map(|(t, perm)| {
+                let q = match t {
+                    Tag::UserObj => Qualifier::UserObj,
+                    Tag::GroupObj => Qualifier::GroupObj,
+                    Tag::Mask => Qualifier::Mask,
+                    Tag::Other => Qualifier::Other,
+                    Tag::User(id) => Qualifier::User(acl_num(resolve_user(id)?)?),
+                    Tag::Group(id) => Qualifier::Group(acl_num(resolve_group(id)?)?),
+                };
+                Ok((q, *perm))
+            })
+            .collect()
+    };
+    let spec = AclSpec {
+        access: conv(&text.access)?,
+        default: conv(&text.default)?,
+        remove_default: text.remove_default,
+    };
+    for (name, list) in [("access", &spec.access), ("default", &spec.default)] {
+        if list.is_empty() {
+            continue;
+        }
+        // Two names for the same ID are only visible after the lookup.
+        for (i, (q, _)) in list.iter().enumerate() {
+            if list[..i].iter().any(|(x, _)| x == q) {
+                return Err(usage(format!("the {name} ACL names the same ID twice")));
             }
         }
         let mut acl = build(list);
@@ -83,15 +151,25 @@ pub fn parse(spec: &str) -> Result<AclSpec> {
         acl.validate()
             .map_err(|_| usage(format!("the {name} ACL is not valid")))?;
     }
-    Ok(out)
+    Ok(spec)
 }
 
 /// ACL qualifiers accept any ID except -1, which libacl treats as undefined.
-fn acl_id(kind: &str, id: u32) -> Result<u32> {
-    if id == u32::MAX {
-        return Err(Fail::new(EXIT_OP, format!("{kind} ID {id} is not allowed")));
+fn acl_id(id: Id) -> Result<Id> {
+    if let Id::Num(n) = id {
+        acl_num(n)?;
     }
     Ok(id)
+}
+
+fn acl_num(n: u32) -> Result<u32> {
+    if n == u32::MAX {
+        return Err(Fail::new(
+            EXIT_OP,
+            format!("ID {n} is not allowed in an ACL"),
+        ));
+    }
+    Ok(n)
 }
 
 /// `rwx`, `r-x`, `-` and so on, or one octal digit.
@@ -160,10 +238,14 @@ pub fn to_text(acl: &PosixACL, prefix: &str) -> String {
 mod tests {
     use super::*;
 
+    fn spec(s: &str) -> Result<AclSpec> {
+        resolve(&parse(s)?)
+    }
+
     #[test]
     fn readme_example() {
-        let s = parse("d:u::rwx,d:g::rwx,d:o::-").unwrap();
-        assert!(s.access.is_empty());
+        let s = spec("d:u::rwx,d:g::rwx,d:o::-").unwrap();
+        assert!(s.access.is_empty() && !s.remove_default);
         assert_eq!(s.default.len(), 3);
         assert_eq!(
             to_text(&build(&s.default), "d:"),
@@ -173,9 +255,8 @@ mod tests {
 
     #[test]
     fn named_entries() {
-        let s =
-            parse("u::rwx,g::r-x,o::0,u:5000:rw,g:6000:7,default:user::7,d:group::5,d:other::-")
-                .unwrap();
+        let s = spec("u::rwx,g::r-x,o::0,u:5000:rw,g:6000:7,default:user::7,d:group::5,d:other::-")
+            .unwrap();
         assert_eq!(s.access.len(), 5);
         assert_eq!(s.default.len(), 3);
         let mut acl = build(&s.access);
@@ -184,6 +265,17 @@ mod tests {
             to_text(&acl, ""),
             "u::rwx,u:5000:rw-,g::r-x,g:6000:rwx,m::rwx,o::---"
         );
+    }
+
+    #[test]
+    fn remove_default() {
+        let s = spec("d:-").unwrap();
+        assert!(s.remove_default && s.access.is_empty() && s.default.is_empty());
+        let s = spec("u::rwx,g::rwx,o::-,default:-").unwrap();
+        assert!(s.remove_default && s.access.len() == 3);
+        assert_eq!(parse("d:-,d:u::rwx,d:g::rwx,d:o::-").unwrap_err().code, 2);
+        assert_eq!(parse("d:-,d:-").unwrap_err().code, 2);
+        assert_eq!(parse("-").unwrap_err().code, 2);
     }
 
     #[test]
@@ -202,6 +294,7 @@ mod tests {
             "x::rwx",
             "d:d:u::rwx",
             "u:rwx",
+            "u::rwx,g::rwx,o::-,u:4294967296:r",
         ] {
             assert_eq!(parse(bad).unwrap_err().code, 2, "{bad:?}");
         }
@@ -209,11 +302,13 @@ mod tests {
             parse("u::rwx,g::rwx,o::-,u:4294967295:r").unwrap_err().code,
             4
         );
+        // Names are looked up only in resolve.
+        let t = parse("u::rwx,g::rwx,o::-,u:no-such-user-xyz:r").unwrap();
+        assert_eq!(resolve(&t).unwrap_err().code, 4);
+        // root and 0 are the same user.
         assert_eq!(
-            parse("u::rwx,g::rwx,o::-,u:no-such-user-xyz:r")
-                .unwrap_err()
-                .code,
-            4
+            spec("u::rwx,g::rwx,o::-,u:root:r,u:0:r").unwrap_err().code,
+            2
         );
         let many = vec!["u:5000:r"; 65].join(",");
         assert_eq!(parse(&many).unwrap_err().code, 2);
@@ -221,6 +316,6 @@ mod tests {
 
     #[test]
     fn system_ids_allowed_in_acl() {
-        assert!(parse("u::rwx,g::rwx,o::-,u:0:r,g:5:r").is_ok());
+        assert!(spec("u::rwx,g::rwx,o::-,u:0:r,g:5:r").is_ok());
     }
 }

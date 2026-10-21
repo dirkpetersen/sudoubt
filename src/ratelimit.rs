@@ -44,22 +44,29 @@ pub fn wait() -> Result<()> {
         if times.len() < MAX_CALLS_PER_MINUTE as usize {
             times.push(now);
             let out: String = times.iter().map(|t| format!("{t}\n")).collect();
-            state.set_len(0).map_err(|e| state_error("write", e))?;
+            // Write first, then cut off the rest, so a failed write never
+            // leaves an empty file behind.
             std::os::unix::fs::FileExt::write_all_at(&*state, out.as_bytes(), 0)
+                .map_err(|e| state_error("write", e))?;
+            state
+                .set_len(out.len() as u64)
                 .map_err(|e| state_error("write", e))?;
             return Ok(());
         }
-        if slot.is_none() {
-            slot = Some(take_slot(&dir)?);
-        }
         let oldest = times.iter().min().copied().unwrap_or(now);
         let wait = (oldest + WINDOW_MS).saturating_sub(now).max(1);
-        drop(state);
-        let _ = writeln!(
-            std::io::stderr(),
-            "sudoubt: rate limit reached, please wait {} seconds",
-            wait.div_ceil(1000)
-        );
+        if slot.is_none() {
+            slot = Some(take_slot(&dir)?);
+            drop(state);
+            // Only once: another call may start first, and then this one waits again.
+            let _ = writeln!(
+                std::io::stderr(),
+                "sudoubt: rate limit reached, please wait {} seconds",
+                wait.div_ceil(1000)
+            );
+        } else {
+            drop(state);
+        }
         std::thread::sleep(std::time::Duration::from_millis(wait));
     }
 }

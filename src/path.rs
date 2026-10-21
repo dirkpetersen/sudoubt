@@ -1,16 +1,17 @@
 //! Path rules and safe path resolution.
 //!
 //! `check` decides from the string alone whether a path is allowed.
-//! `open_parent` and `open_target` walk it from the allowed root one
-//! component at a time with `O_NOFOLLOW`, so a symlink cannot redirect them.
+//! `open_parent` and `open_target` walk it from `/` one component at a time
+//! with `O_NOFOLLOW`, so a symlink cannot redirect them. sudoubt works on
+//! directories only.
 
 use std::ffi::OsStr;
 use std::fs::File;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::OwnedFd;
 
 use nix::errno::Errno;
-use nix::fcntl::{AtFlags, OFlag, open, openat};
-use nix::sys::stat::{FileStat, Mode, SFlag, fstat, fstatat};
+use nix::fcntl::{OFlag, open, openat};
+use nix::sys::stat::{FileStat, Mode, SFlag, fstat};
 
 use crate::{ALLOWED_ROOTS, EXIT_FS, EXIT_PATH, Fail, Result};
 
@@ -65,81 +66,60 @@ pub fn check(path: &OsStr) -> Result<(&'static str, Vec<String>)> {
     Err(refused("path is outside the allowed roots"))
 }
 
-/// Open the directory that holds the target. Every component below the
-/// root must be a real directory, not a symlink.
+/// Open the directory that holds the target. Every component from `/` down,
+/// including the allowed root itself, must be a real directory, not a symlink.
 pub fn open_parent(root: &str, rel: &[String]) -> Result<OwnedFd> {
-    // The root is set by the admin at build time and is trusted.
     let mut dir = open(
-        root,
+        "/",
         OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|e| fs_error(&format!("cannot open allowed root {root}"), e))?;
-    for c in &rel[..rel.len() - 1] {
-        let fd = openat(
+    .map_err(|e| fs_error("cannot open /", e))?;
+    let root_comps = root[1..].split('/');
+    let rel_comps = rel[..rel.len() - 1].iter().map(String::as_str);
+    for c in root_comps.chain(rel_comps) {
+        let fd = match openat(
             &dir,
-            c.as_str(),
+            c,
             OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
             Mode::empty(),
-        )
-        .map_err(|e| fs_error(&format!("cannot open {c:?}"), e))?;
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::ENOENT) => return Err(Fail::new(EXIT_FS, format!("{c:?} does not exist"))),
+            Err(e) => return Err(fs_error(&format!("cannot open {c:?}"), e)),
+        };
         let st = fstat(&fd).map_err(|e| fs_error(&format!("cannot stat {c:?}"), e))?;
         match kind(&st) {
             SFlag::S_IFDIR => dir = fd,
             SFlag::S_IFLNK => return Err(refused("path goes through a symlink")),
-            _ => return Err(Fail::new(EXIT_FS, format!("{c:?} is not a directory"))),
+            _ => {
+                return Err(refused(format!(
+                    "path goes through {c:?}, which is not a directory"
+                )));
+            }
         }
     }
     Ok(dir)
 }
 
-/// The opened target. `file` is opened read-only and used for every operation.
-pub struct Target {
-    pub file: File,
-    pub is_dir: bool,
-}
-
-/// Open the last component in `parent`. It must be a directory or a regular
-/// file with one link. Symlinks, devices, FIFOs and sockets are refused.
-pub fn open_target(parent: &OwnedFd, name: &str) -> Result<Target> {
-    let st = match fstatat(parent.as_fd(), name, AtFlags::AT_SYMLINK_NOFOLLOW) {
-        Ok(st) => st,
-        Err(Errno::ENOENT) => return Err(Fail::new(EXIT_FS, "path does not exist")),
-        Err(e) => return Err(fs_error("cannot stat path", e)),
-    };
-    let flags = OFlag::O_RDONLY
-        | OFlag::O_NOFOLLOW
-        | OFlag::O_NONBLOCK
-        | OFlag::O_NOCTTY
-        | OFlag::O_CLOEXEC;
-    let is_dir = match kind(&st) {
-        SFlag::S_IFDIR => true,
-        SFlag::S_IFREG => false,
-        SFlag::S_IFLNK => return Err(refused("path is a symlink")),
-        _ => return Err(refused("path is not a regular file or directory")),
-    };
-    let flags = if is_dir {
-        flags | OFlag::O_DIRECTORY
-    } else {
-        flags
-    };
+/// Open the last component in `parent` as a directory, read-only, for every
+/// operation. `O_DIRECTORY` makes the kernel refuse anything else before it
+/// opens it, so devices and FIFOs are never opened, and `O_NOFOLLOW` refuses
+/// a symlink.
+pub fn open_target(parent: &OwnedFd, name: &str) -> Result<File> {
+    let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
     let fd = match openat(parent, name, flags, Mode::empty()) {
         Ok(fd) => fd,
+        Err(Errno::ENOENT) => return Err(Fail::new(EXIT_FS, "path does not exist")),
         Err(Errno::ELOOP) => return Err(refused("path is a symlink")),
+        Err(Errno::ENOTDIR) => return Err(refused("path is not a directory")),
         Err(e) => return Err(fs_error("cannot open path", e)),
     };
-    let st2 = fstat(&fd).map_err(|e| fs_error("cannot stat path", e))?;
-    if st2.st_dev != st.st_dev || st2.st_ino != st.st_ino || kind(&st2) != kind(&st) {
-        return Err(refused("path changed while it was opened"));
+    let st = fstat(&fd).map_err(|e| fs_error("cannot stat path", e))?;
+    if kind(&st) != SFlag::S_IFDIR {
+        return Err(refused("path is not a directory"));
     }
-    // A hard link could point to a file outside the allowed roots.
-    if !is_dir && st2.st_nlink > 1 {
-        return Err(refused("path is a file with more than one hard link"));
-    }
-    Ok(Target {
-        file: File::from(fd),
-        is_dir,
-    })
+    Ok(File::from(fd))
 }
 
 fn kind(st: &FileStat) -> SFlag {

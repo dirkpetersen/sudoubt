@@ -11,6 +11,7 @@ mod request;
 
 use std::ffi::{CString, OsString};
 use std::io::Write;
+use std::panic::AssertUnwindSafe;
 use std::process::ExitCode;
 
 use nix::unistd::{Gid, Uid};
@@ -70,13 +71,31 @@ fn main() -> ExitCode {
         format!("uid {ruid}")
     };
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    // Rust's runtime has already reopened closed fds 0 to 2 on /dev/null, so
+    // no file opened below can land on stdout or stderr.
     // SAFETY: no other threads exist yet.
     unsafe { libc::clearenv() };
     nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
 
     let path = args.first().map(|p| p.to_string_lossy().into_owned());
     let mut results = Map::new();
-    let outcome = run(&args, &mut results);
+    // posix-acl panics on allocation failure. Report a panic as an internal error.
+    let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| run(&args, &mut results)))
+        .unwrap_or_else(|_| Err(Fail::new(EXIT_INTERNAL, "internal error")));
+
+    // Log before writing to stdout and stderr: the caller can make those block.
+    let ops: Vec<String> = args
+        .iter()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let result = match &outcome {
+        Ok(()) => "ok".to_string(),
+        Err(f) => format!("exit={} error={:?}", f.code, f.msg),
+    };
+    log(&format!(
+        "caller={caller:?} path={path:?} ops={ops:?} result={result}"
+    ));
 
     let mut out = Map::new();
     out.insert("ok".into(), json!(outcome.is_ok()));
@@ -93,19 +112,6 @@ fn main() -> ExitCode {
     if let Err(f) = &outcome {
         let _ = writeln!(std::io::stderr(), "sudoubt: {}", f.msg);
     }
-
-    let ops: Vec<String> = args
-        .iter()
-        .skip(1)
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
-    let result = match &outcome {
-        Ok(()) => "ok".to_string(),
-        Err(f) => format!("exit={} error={:?}", f.code, f.msg),
-    };
-    log(&format!(
-        "caller={caller:?} path={path:?} ops={ops:?} result={result}"
-    ));
 
     ExitCode::from(outcome.err().map_or(0, |f| f.code))
 }
@@ -126,13 +132,54 @@ fn run(args: &[OsString], results: &mut Map<String, Value>) -> Result<()> {
 }
 
 /// Make real, effective and saved IDs root and drop supplementary groups, so the
-/// caller can no longer signal or trace the process in setuid mode.
+/// caller can no longer signal or trace the process in setuid mode. Then undo
+/// what the caller can pass through exec to stop the process halfway: timers,
+/// resource limits and blocked signals.
 fn become_root() -> Result<()> {
     let fail = |e: nix::Error| Fail::new(EXIT_INTERNAL, format!("cannot become root: {e}"));
     nix::unistd::setgroups(&[]).map_err(fail)?;
     nix::unistd::setresgid(Gid::from_raw(0), Gid::from_raw(0), Gid::from_raw(0)).map_err(fail)?;
     nix::unistd::setresuid(Uid::from_raw(0), Uid::from_raw(0), Uid::from_raw(0)).map_err(fail)?;
     nix::sys::prctl::set_dumpable(false).map_err(fail)?;
+
+    // SAFETY: plain system calls on local values.
+    unsafe {
+        let zero: libc::itimerval = std::mem::zeroed();
+        for timer in [libc::ITIMER_REAL, libc::ITIMER_VIRTUAL, libc::ITIMER_PROF] {
+            if libc::setitimer(timer, &zero, std::ptr::null_mut()) != 0 {
+                return Err(fail(nix::Error::last()));
+            }
+        }
+        let unlimited = libc::rlimit {
+            rlim_cur: libc::RLIM_INFINITY,
+            rlim_max: libc::RLIM_INFINITY,
+        };
+        for res in [
+            libc::RLIMIT_CPU,
+            libc::RLIMIT_FSIZE,
+            libc::RLIMIT_AS,
+            libc::RLIMIT_DATA,
+        ] {
+            if libc::setrlimit(res, &unlimited) != 0 {
+                return Err(fail(nix::Error::last()));
+            }
+        }
+        let files = libc::rlimit {
+            rlim_cur: 1024,
+            rlim_max: 1024,
+        };
+        let mut cur: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut cur) != 0
+            || (cur.rlim_cur < 1024 && libc::setrlimit(libc::RLIMIT_NOFILE, &files) != 0)
+        {
+            return Err(fail(nix::Error::last()));
+        }
+        let mut none: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut none);
+        if libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut()) != 0 {
+            return Err(fail(nix::Error::last()));
+        }
+    }
     Ok(())
 }
 

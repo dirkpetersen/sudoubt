@@ -1,12 +1,19 @@
-//! Parse and check the command line. Nothing here touches the file system,
-//! except name lookups for chown and setfacl.
+//! Parse and check the command line. Nothing here touches the file system or
+//! looks up names; names are resolved later, after the rate limit.
 
 use std::ffi::OsString;
 
-use nix::unistd::{Gid, Group, Uid, User};
+use nix::unistd::{Group, User};
 
-use crate::acl::AclSpec;
+use crate::acl::AclText;
 use crate::{ALLOWED_XATTRS, EXIT_OP, EXIT_USAGE, Fail, Result, path};
+
+/// A user or group as given: a numeric ID or a name to look up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Id {
+    Num(u32),
+    Name(String),
+}
 
 /// One checked invocation: one path and each operation at most once.
 #[derive(Debug, Default)]
@@ -15,9 +22,9 @@ pub struct Request {
     /// Path components below the root. Never empty.
     pub rel: Vec<String>,
     pub mkdir: bool,
-    pub chown: Option<(String, Uid, Gid)>,
+    pub chown: Option<(String, Id, Id)>,
     pub chmod: Option<(String, u32)>,
-    pub setfacl: Option<(String, AclSpec)>,
+    pub setfacl: Option<(String, AclText)>,
     pub setfattr: Option<Vec<(&'static str, u64)>>,
     pub getfacl: bool,
     pub getfattr: Option<Vec<&'static str>>,
@@ -113,8 +120,8 @@ pub fn parse(args: &[OsString]) -> Result<Request> {
     Ok(req)
 }
 
-/// `NNN` or `NNNN` in octal. Setuid is refused. Setgid is checked later,
-/// when the file type is known.
+/// `NNN` or `NNNN` in octal. Setuid is refused. Setgid is allowed, because
+/// sudoubt works on directories only.
 pub fn parse_chmod(v: &str) -> Result<u32> {
     if !(3..=4).contains(&v.len()) || !v.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
         return Err(usage(format!(
@@ -128,21 +135,28 @@ pub fn parse_chmod(v: &str) -> Result<u32> {
     Ok(mode)
 }
 
-/// `user:group`, each a name or a numeric ID.
-fn parse_chown(v: &str) -> Result<(String, Uid, Gid)> {
+/// `user:group`, each a name or a numeric ID. Numeric IDs are checked here,
+/// names after they are looked up.
+fn parse_chown(v: &str) -> Result<(String, Id, Id)> {
     let Some((u, g)) = v.split_once(':') else {
         return Err(usage(format!("--chown needs user:group, not {v:?}")));
     };
     if u.is_empty() || g.is_empty() || g.contains(':') {
         return Err(usage(format!("--chown needs user:group, not {v:?}")));
     }
-    let uid = check_id("user", lookup_user(u)?)?;
-    let gid = check_id("group", lookup_group(g)?)?;
-    Ok((v.to_string(), Uid::from_raw(uid), Gid::from_raw(gid)))
+    let user = parse_id(u)?;
+    let group = parse_id(g)?;
+    if let Id::Num(n) = user {
+        check_owner_id("user", n)?;
+    }
+    if let Id::Num(n) = group {
+        check_owner_id("group", n)?;
+    }
+    Ok((v.to_string(), user, group))
 }
 
 /// Refuse system IDs (1 to 999) and -1, which chown reads as "do not change".
-pub fn check_id(kind: &str, id: u32) -> Result<u32> {
+pub fn check_owner_id(kind: &str, id: u32) -> Result<u32> {
     if (1..=999).contains(&id) {
         return Err(refused(format!(
             "{kind} ID {id} is a system account (1 to 999)"
@@ -154,37 +168,39 @@ pub fn check_id(kind: &str, id: u32) -> Result<u32> {
     Ok(id)
 }
 
-/// A decimal number if all digits, else a name looked up through NSS.
-fn parse_id(s: &str) -> Option<Result<u32>> {
+/// A decimal number if all digits, else a name.
+pub fn parse_id(s: &str) -> Result<Id> {
     if s.bytes().all(|b| b.is_ascii_digit()) {
-        Some(
-            s.parse::<u32>()
-                .map_err(|_| usage(format!("ID {s:?} is too large"))),
-        )
+        let n = s
+            .parse::<u32>()
+            .map_err(|_| usage(format!("ID {s:?} is too large")))?;
+        Ok(Id::Num(n))
     } else {
-        None
+        Ok(Id::Name(s.to_string()))
     }
 }
 
-pub fn lookup_user(s: &str) -> Result<u32> {
-    if let Some(id) = parse_id(s) {
-        return id;
-    }
-    match User::from_name(s) {
-        Ok(Some(u)) => Ok(u.uid.as_raw()),
-        Ok(None) => Err(refused(format!("unknown user {s:?}"))),
-        Err(e) => Err(refused(format!("cannot look up user {s:?}: {e}"))),
+/// Look up a user name through NSS. Numeric IDs pass through.
+pub fn resolve_user(id: &Id) -> Result<u32> {
+    match id {
+        Id::Num(n) => Ok(*n),
+        Id::Name(s) => match User::from_name(s) {
+            Ok(Some(u)) => Ok(u.uid.as_raw()),
+            Ok(None) => Err(refused(format!("unknown user {s:?}"))),
+            Err(e) => Err(refused(format!("cannot look up user {s:?}: {e}"))),
+        },
     }
 }
 
-pub fn lookup_group(s: &str) -> Result<u32> {
-    if let Some(id) = parse_id(s) {
-        return id;
-    }
-    match Group::from_name(s) {
-        Ok(Some(g)) => Ok(g.gid.as_raw()),
-        Ok(None) => Err(refused(format!("unknown group {s:?}"))),
-        Err(e) => Err(refused(format!("cannot look up group {s:?}: {e}"))),
+/// Look up a group name through NSS. Numeric IDs pass through.
+pub fn resolve_group(id: &Id) -> Result<u32> {
+    match id {
+        Id::Num(n) => Ok(*n),
+        Id::Name(s) => match Group::from_name(s) {
+            Ok(Some(g)) => Ok(g.gid.as_raw()),
+            Ok(None) => Err(refused(format!("unknown group {s:?}"))),
+            Err(e) => Err(refused(format!("cannot look up group {s:?}: {e}"))),
+        },
     }
 }
 
@@ -278,15 +294,15 @@ mod tests {
             "--chmod",
             "2770",
             "--chown",
-            "0:5000",
+            "root:5000",
             "--mkdir",
         ]))
         .unwrap();
         assert!(r.mkdir && r.has_write());
         assert_eq!(r.rel, ["p", "all"]);
         assert_eq!(r.chmod.unwrap().1, 0o2770);
-        assert_eq!(r.chown.as_ref().unwrap().1.as_raw(), 0);
-        assert_eq!(r.chown.unwrap().2.as_raw(), 5000);
+        let (_, u, g) = r.chown.unwrap();
+        assert_eq!((u, g), (Id::Name("root".into()), Id::Num(5000)));
     }
 
     #[test]
@@ -315,17 +331,38 @@ mod tests {
 
     #[test]
     fn chown() {
-        assert_eq!(parse_chown("0:0").unwrap().1.as_raw(), 0);
-        assert_eq!(parse_chown("1000:1000").unwrap().2.as_raw(), 1000);
-        assert_eq!(parse_chown("root:0").unwrap().1.as_raw(), 0);
+        assert_eq!(parse_chown("0:0").unwrap().1, Id::Num(0));
+        assert_eq!(parse_chown("1000:1000").unwrap().2, Id::Num(1000));
         assert_eq!(parse_chown("1:1000").unwrap_err().code, 4);
         assert_eq!(parse_chown("1000:999").unwrap_err().code, 4);
         assert_eq!(parse_chown("4294967295:1000").unwrap_err().code, 4);
         assert_eq!(parse_chown("1000:4294967296").unwrap_err().code, 2);
-        assert_eq!(parse_chown("no-such-user-xyz:0").unwrap_err().code, 4);
+        // Names are not looked up while parsing.
+        assert_eq!(
+            parse_chown("no-such-user-xyz:0").unwrap().1,
+            Id::Name("no-such-user-xyz".into())
+        );
         for bad in ["1000", ":1000", "1000:", "1:2:3", ""] {
             assert_eq!(parse_chown(bad).unwrap_err().code, 2, "{bad}");
         }
+    }
+
+    #[test]
+    fn resolve() {
+        assert_eq!(resolve_user(&Id::Name("root".into())).unwrap(), 0);
+        assert_eq!(resolve_group(&Id::Num(5000)).unwrap(), 5000);
+        assert_eq!(
+            resolve_user(&Id::Name("no-such-user-xyz".into()))
+                .unwrap_err()
+                .code,
+            4
+        );
+        assert_eq!(
+            resolve_group(&Id::Name("no-such-group-xyz".into()))
+                .unwrap_err()
+                .code,
+            4
+        );
     }
 
     #[test]
@@ -336,6 +373,12 @@ mod tests {
         );
         assert_eq!(parse_setfattr("user.x=1").unwrap_err().code, 4);
         assert_eq!(parse_setfattr("security.capability=1").unwrap_err().code, 4);
+        assert_eq!(
+            parse_setfattr("system.posix_acl_default=1")
+                .unwrap_err()
+                .code,
+            4
+        );
         assert_eq!(
             parse_setfattr("ceph.quota.max_bytes=-1").unwrap_err().code,
             4
