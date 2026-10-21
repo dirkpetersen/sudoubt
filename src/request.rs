@@ -49,8 +49,9 @@ fn refused(msg: impl Into<String>) -> Fail {
     Fail::new(EXIT_OP, msg)
 }
 
-/// Parse `<path> --op [value] ...`. Usage errors (exit 2) come before path
-/// errors (exit 3), which come before refused values (exit 4).
+/// Parse `<path> --op [value] ...`. Unknown, missing and duplicate options
+/// (exit 2) are found before path errors (exit 3); then the values are
+/// checked (exit 2 if malformed, exit 4 if refused).
 pub fn parse(args: &[OsString]) -> Result<Request> {
     let Some((path_arg, rest)) = args.split_first() else {
         return Err(usage("usage: sudoubt <path> --op [value] ..."));
@@ -168,8 +169,11 @@ pub fn check_owner_id(kind: &str, id: u32) -> Result<u32> {
     Ok(id)
 }
 
-/// A decimal number if all digits, else a name.
+/// A decimal number if all digits, else a name of at most 256 bytes.
 pub fn parse_id(s: &str) -> Result<Id> {
+    if s.len() > 256 {
+        return Err(usage("user or group name is too long"));
+    }
     if s.bytes().all(|b| b.is_ascii_digit()) {
         let n = s
             .parse::<u32>()

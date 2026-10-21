@@ -26,7 +26,7 @@ These are the security model. Do not weaken them without the owner's approval.
 
 - Only these operations: mkdir, chown, chmod, setfacl, getfacl, setfattr, getfattr. Refuse everything else.
 - Do the system calls in Rust (`nix`, `posix-acl`, `xattr`). Never run a shell or an external binary.
-- Only absolute paths to directories. Refuse relative paths, `..`, an allowed root itself, any path outside the allowed roots, and anything that is not a directory (files, symlinks, devices).
+- Only absolute paths to directories. Refuse relative paths, `..`, an allowed root itself, any path outside the allowed roots, `.snap` components, paths that cross a mount point below the root, and anything that is not a directory (files, symlinks, devices).
 - `ALLOWED_ROOTS` is a compiled-in constant, default `["/storage/test"]`. No config file, env var or CLI option may change it.
 - Resolve paths from `/` with `openat` + `O_NOFOLLOW` on each component, including the components of the allowed root, so no symlink is ever followed. Run every operation on the one opened directory fd.
 - One invocation = one path. It can have many operations, but each operation at most once (duplicate = exit 2). Validate all operations before running any (name lookups happen after the rate limit wait, but still before the first operation). Run them in fixed order: mkdir, chown, chmod, setfacl, setfattr, getfacl, getfattr. Stop at the first failure.

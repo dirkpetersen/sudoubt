@@ -9,7 +9,7 @@
 //! kernel releases its slot lock.
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::fd::OwnedFd;
 
 use nix::errno::Errno;
@@ -59,11 +59,10 @@ pub fn wait() -> Result<()> {
             slot = Some(take_slot(&dir)?);
             drop(state);
             // Only once: another call may start first, and then this one waits again.
-            let _ = writeln!(
-                std::io::stderr(),
+            crate::note(&format!(
                 "sudoubt: rate limit reached, please wait {} seconds",
                 wait.div_ceil(1000)
-            );
+            ));
         } else {
             drop(state);
         }
@@ -71,17 +70,15 @@ pub fn wait() -> Result<()> {
     }
 }
 
-/// One start time per line. Times in the future mean the file is broken.
+/// One start time per line. A time in the future can only come from an
+/// earlier boot (if /run is not tmpfs); it counts as now, so it expires.
 fn parse(text: &str, now: u64) -> Result<Vec<u64>> {
     let mut times = Vec::new();
     for line in text.lines() {
         let t: u64 = line
             .parse()
             .map_err(|_| state_error("state file", "bad line"))?;
-        if t > now {
-            return Err(state_error("state file", "time in the future"));
-        }
-        times.push(t);
+        times.push(t.min(now));
         if times.len() > 1000 {
             return Err(state_error("state file", "too many lines"));
         }
@@ -156,7 +153,7 @@ mod tests {
     fn parse_state() {
         assert_eq!(parse("", 10).unwrap(), Vec::<u64>::new());
         assert_eq!(parse("1\n5\n", 10).unwrap(), [1, 5]);
-        assert_eq!(parse("11\n", 10).unwrap_err().code, 6);
+        assert_eq!(parse("11\n", 10).unwrap(), [10]);
         assert_eq!(parse("x\n", 10).unwrap_err().code, 6);
         assert_eq!(parse("-1\n", 10).unwrap_err().code, 6);
     }

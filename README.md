@@ -83,7 +83,7 @@ In setuid mode there is no sudo to clean the environment, so sudoubt does it its
 - It checks that the effective UID is 0.
 - It resets timers, resource limits and blocked signals that the caller passed on.
 
-Both modes fail closed if the web server runs with `NoNewPrivileges=yes` (systemd) or if the binary is on a file system mounted `nosuid`: sudo refuses to run, and the setuid bit is ignored, so sudoubt exits with code 7.
+Both modes fail closed if the web server runs with `NoNewPrivileges=yes` (systemd) or if the binary is on a file system mounted `nosuid`: sudo refuses to run, and the setuid bit is ignored, so sudoubt exits with code 7. A systemd `CapabilityBoundingSet=` on the web service is inherited too, and makes sudoubt fail with exit code 1 or 5. CephFS `root_squash` makes the operations fail with exit code 5.
 
 ## Usage
 
@@ -163,7 +163,11 @@ Failure:
 
 On exit code 5, `results` holds the operations that completed before the failure.
 
-One exception to "did nothing": if `--mkdir` creates the directory and someone with write access to the parent replaces it before sudoubt opens it, the call fails with exit code 3 or 5 and the directory was created.
+One exception to "did nothing": if `--mkdir` creates the directory and someone with write access to the parent replaces it before sudoubt opens it, the call fails with exit code 3 and the directory was created. sudoubt detects the swap because only root can make a root-owned directory with no group or other permissions.
+
+### Group-writable parent directories
+
+sudoubt acts on whatever directory has the given name when it runs. If a project member can write to the parent of a target (for example `/storage/test/proj` with mode `2770`), the member can rename another directory in that parent to the target's name, and the next sudoubt call changes that directory instead. sudoubt cannot tell this apart from a legitimate call. To prevent it, set the sticky bit on group-writable project directories (mode `3770` instead of `2770`): then members can only rename their own entries, not root's or each other's.
 
 The JSON format is not final.
 
@@ -197,7 +201,9 @@ sudoubt works only on paths inside one of these roots. It refuses:
 - paths with `..` components,
 - paths outside all allowed roots,
 - an allowed root itself (for example `/storage/test`), so the caller cannot change the owner or mode of the root,
-- paths that go through a symlink (see below).
+- paths that go through a symlink (see below), including symlinks in the allowed root itself,
+- paths that cross a mount point below the allowed root,
+- paths with a `.snap` component (on CephFS, mkdir there creates a snapshot).
 
 ## Rate limit
 
@@ -218,11 +224,11 @@ const MAX_WAITING: u32 = 25;
 
 - **Too many waiting.** If 25 calls are already waiting, a new write call fails at once with exit code 8. This stops an attacker from queuing a very large number of calls.
 
-sudoubt keeps its state in `/run/sudoubt/`. This directory is on tmpfs, so the state resets at reboot. It is owned by root with mode `0700`, so the web app cannot read or change it. A file lock (`flock`) on the state file makes sure that two calls at the same time cannot both pass the check. Each waiting call holds a lock on one of 25 slot files. If a call stops or is killed, the kernel releases its lock, so a crashed call never keeps a slot.
+sudoubt keeps its state in `/run/sudoubt/`. This directory is on tmpfs, so the state resets at reboot. (If `/run` is not tmpfs, start times from an earlier boot count as "now" and expire after a minute.) It is owned by root with mode `0700`, so the web app cannot read or change it. A file lock (`flock`) on the state file makes sure that two calls at the same time cannot both pass the check. Each waiting call holds a lock on one of 25 slot files. If a call stops or is killed, the kernel releases its lock, so a crashed call never keeps a slot.
 
 ## Logging
 
-sudoubt writes one line to syslog (journald) for every call, also for refused calls. The line contains the caller, the path, the operations, and the result or exit code.
+sudoubt writes one line to syslog (journald, facility `authpriv`) for every call, also for refused calls. The line contains the caller, the path, the operations, and the result or exit code. It is written before the JSON output. The path and the operations are cut to 512 bytes each.
 
 The caller is the `SUDO_USER` that sudo sets in sudo mode, and the real UID in setuid mode. In setuid mode, sudoubt never reads the caller from the environment, because the caller controls it.
 
@@ -233,14 +239,14 @@ The caller is the `SUDO_USER` that sudo sets in sudo mode, and the real UID in s
 | 0    | Success. All operations completed. |
 | 1    | Internal error that does not fit another code. |
 | 2    | Usage error: unknown option, missing or malformed value, or an operation that occurs more than once. |
-| 3    | Path refused: not absolute, outside the allowed roots, contains `.` or `..` or an empty component, is an allowed root, goes through or is a symlink, or is not a directory. |
+| 3    | Path refused: not absolute, outside the allowed roots, contains `.`, `..`, `.snap` or an empty component, is an allowed root, goes through or is a symlink, crosses a mount point, is not a directory, or (with `--mkdir`) the new directory was replaced. |
 | 4    | Operation refused: for example a setuid mode, a system UID or GID, or an xattr name that is not on the allowlist. |
-| 5    | The operation failed on the file system: for example the path does not exist, the mkdir path is not a directory, or no ACL support. |
+| 5    | The operation failed on the file system: for example the path or its parent does not exist, or the file system has no ACL or quota support. |
 | 6    | Rate limit state error: sudoubt cannot open or lock its state files in `/run/sudoubt/`. |
 | 7    | Not running as root (effective UID is not 0). |
 | 8    | Too many waiting: 25 write calls already wait for the rate limit. |
 
-For codes 2, 3, 4, 6, 7 and 8 sudoubt did nothing. For code 5, the operations before the failed one are complete.
+For codes 2, 3, 4, 6, 7 and 8 sudoubt did nothing, except for the `--mkdir` race described under [Output](#output). For code 5, the operations before the failed one are complete.
 
 ## Security model
 
@@ -254,7 +260,7 @@ sudoubt assumes that the caller is hostile. The design must stop a compromised w
 - **No setuid bits.** chmod must not set setuid. A setuid binary inside a project folder would give root to any user. sudoubt refuses setuid even though it only works on directories, where the bit has no effect. ProjectVault uses setgid on directories, so setgid is allowed.
 - **Safe owners.** chown must refuse system UIDs and GIDs (1 to 999), so the caller cannot hand a directory to a service account. Root (0) is allowed, because ProjectVault makes root the owner of project folders.
 - **Caller check.** sudoubt does not check who the caller is. The sudoers rule (option 1) or the file mode and group (option 2) decide who can run it.
-- **Clean start in setuid mode.** See [Option 2](#option-2-setuid-root). sudoubt also sets its real, effective and saved user and group IDs to root and drops supplementary groups, so the caller cannot signal or trace it while it runs.
+- **Clean start in setuid mode.** See [Option 2](#option-2-setuid-root). sudoubt also sets its real, effective and saved user and group IDs to root and drops supplementary groups, so the caller cannot signal or trace it while it runs. In sudo mode, sudo passes signals such as SIGTERM from the caller on to sudoubt, so a call can be stopped between two operations; the result is the same as a failed operation (exit code 5): the earlier operations are done.
 - **Rate limit.** A compromised web app cannot flood the file system with changes or queue an unlimited number of calls.
 - **Small code.** The tool must stay small enough to read in one sitting.
 

@@ -93,8 +93,9 @@ fn main() -> ExitCode {
         Ok(()) => "ok".to_string(),
         Err(f) => format!("exit={} error={:?}", f.code, f.msg),
     };
+    let (path_log, ops_log) = (clip(&format!("{path:?}")), clip(&format!("{ops:?}")));
     log(&format!(
-        "caller={caller:?} path={path:?} ops={ops:?} result={result}"
+        "caller={caller:?} path={path_log} ops={ops_log} result={result}"
     ));
 
     let mut out = Map::new();
@@ -174,6 +175,8 @@ fn become_root() -> Result<()> {
         {
             return Err(fail(nix::Error::last()));
         }
+        // A background job writing to a terminal would be stopped by SIGTTOU.
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
         let mut none: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut none);
         if libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut()) != 0 {
@@ -181,6 +184,37 @@ fn become_root() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Shorten caller-supplied text for the log, so one call cannot flood it.
+fn clip(s: &str) -> String {
+    const MAX: usize = 512;
+    if s.len() <= MAX {
+        return s.to_string();
+    }
+    let mut end = MAX;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...(truncated)", &s[..end])
+}
+
+/// Write a short message to stderr only if that cannot block, so a caller
+/// that does not read stderr cannot stall a waiting call.
+pub fn note(msg: &str) {
+    let line = format!("{msg}\n");
+    let mut fds = libc::pollfd {
+        fd: libc::STDERR_FILENO,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd; the buffer outlives the write. Writes up to
+    // PIPE_BUF bytes are atomic, so POLLOUT means this one fits.
+    unsafe {
+        if libc::poll(&mut fds, 1, 0) == 1 && fds.revents & libc::POLLOUT != 0 {
+            libc::write(libc::STDERR_FILENO, line.as_ptr().cast(), line.len());
+        }
+    }
 }
 
 /// Write one line to syslog (authpriv). The message is built with `{:?}` quoting,

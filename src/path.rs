@@ -49,6 +49,10 @@ pub fn check(path: &OsStr) -> Result<(&'static str, Vec<String>)> {
         if *c == "." || *c == ".." {
             return Err(refused("path contains . or .."));
         }
+        // The CephFS snapshot directory: mkdir there creates a snapshot.
+        if *c == ".snap" {
+            return Err(refused("path contains .snap"));
+        }
         if c.len() > MAX_NAME {
             return Err(refused("path component is too long"));
         }
@@ -66,18 +70,27 @@ pub fn check(path: &OsStr) -> Result<(&'static str, Vec<String>)> {
     Err(refused("path is outside the allowed roots"))
 }
 
+/// The directory that holds the target, and the device of the allowed root.
+pub struct Parent {
+    pub fd: OwnedFd,
+    pub dev: u64,
+}
+
 /// Open the directory that holds the target. Every component from `/` down,
-/// including the allowed root itself, must be a real directory, not a symlink.
-pub fn open_parent(root: &str, rel: &[String]) -> Result<OwnedFd> {
+/// including the allowed root itself, must be a real directory, not a
+/// symlink. Components below the root must be on the root's file system.
+pub fn open_parent(root: &str, rel: &[String]) -> Result<Parent> {
     let mut dir = open(
         "/",
         OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
         Mode::empty(),
     )
     .map_err(|e| fs_error("cannot open /", e))?;
-    let root_comps = root[1..].split('/');
+    let root_comps: Vec<&str> = root[1..].split('/').collect();
+    let n_root = root_comps.len();
     let rel_comps = rel[..rel.len() - 1].iter().map(String::as_str);
-    for c in root_comps.chain(rel_comps) {
+    let mut dev = 0;
+    for (i, c) in root_comps.into_iter().chain(rel_comps).enumerate() {
         let fd = match openat(
             &dir,
             c,
@@ -90,7 +103,7 @@ pub fn open_parent(root: &str, rel: &[String]) -> Result<OwnedFd> {
         };
         let st = fstat(&fd).map_err(|e| fs_error(&format!("cannot stat {c:?}"), e))?;
         match kind(&st) {
-            SFlag::S_IFDIR => dir = fd,
+            SFlag::S_IFDIR => {}
             SFlag::S_IFLNK => return Err(refused("path goes through a symlink")),
             _ => {
                 return Err(refused(format!(
@@ -98,17 +111,23 @@ pub fn open_parent(root: &str, rel: &[String]) -> Result<OwnedFd> {
                 )));
             }
         }
+        if i + 1 == n_root {
+            dev = st.st_dev;
+        } else if i >= n_root && st.st_dev != dev {
+            return Err(refused("path crosses a mount point below the allowed root"));
+        }
+        dir = fd;
     }
-    Ok(dir)
+    Ok(Parent { fd: dir, dev })
 }
 
 /// Open the last component in `parent` as a directory, read-only, for every
 /// operation. `O_DIRECTORY` makes the kernel refuse anything else before it
 /// opens it, so devices and FIFOs are never opened, and `O_NOFOLLOW` refuses
-/// a symlink.
-pub fn open_target(parent: &OwnedFd, name: &str) -> Result<File> {
+/// a symlink. Returns the directory and its status.
+pub fn open_target(parent: &Parent, name: &str) -> Result<(File, FileStat)> {
     let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
-    let fd = match openat(parent, name, flags, Mode::empty()) {
+    let fd = match openat(&parent.fd, name, flags, Mode::empty()) {
         Ok(fd) => fd,
         Err(Errno::ENOENT) => return Err(Fail::new(EXIT_FS, "path does not exist")),
         Err(Errno::ELOOP) => return Err(refused("path is a symlink")),
@@ -119,7 +138,10 @@ pub fn open_target(parent: &OwnedFd, name: &str) -> Result<File> {
     if kind(&st) != SFlag::S_IFDIR {
         return Err(refused("path is not a directory"));
     }
-    Ok(File::from(fd))
+    if st.st_dev != parent.dev {
+        return Err(refused("path is a mount point below the allowed root"));
+    }
+    Ok((File::from(fd), st))
 }
 
 fn kind(st: &FileStat) -> SFlag {
@@ -164,6 +186,8 @@ mod tests {
             "//storage/test/a",
             "/storage/test/a\nb",
             "/storage/test/a\0b",
+            "/storage/test/p/.snap",
+            "/storage/test/p/.snap/keep",
         ] {
             assert_eq!(code(p), 3, "{p:?}");
         }

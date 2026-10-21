@@ -37,3 +37,8 @@ ok
 Following some links is not allowed Need to only look at the real folder 
 → Done. sudoubt now walks from `/` with `O_NOFOLLOW` on every component, including `/storage` and `/storage/test`. If any of them is a symlink, the call fails with exit 3.
 
+## New after deep review 1
+
+12. **Only root-owned target directories?** A project member who can write to a target's parent can rename another directory to the target's name; the next sudoubt call then changes that one (README "Group-writable parent directories"). sudoubt now detects this for directories it just created, and the README recommends the sticky bit (`3770`) on group-writable project directories. A stronger fix would be to refuse every existing target that is not owned by root. That breaks any ProjectVault call on a directory owned by a user (for example a personal folder chowned to `alice:proj`). Should sudoubt refuse non-root-owned targets, or is the sticky-bit advice enough?
+13. **Should ProjectVault's example use mode `3770`** (setgid plus sticky) instead of `2770` for project folders? The README example still shows `2770`.
+

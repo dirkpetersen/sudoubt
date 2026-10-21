@@ -339,6 +339,77 @@ fn not_root() {
 }
 
 #[test]
+fn setuid_mode() {
+    let Some((_g, dir)) = setup("setuid") else {
+        return;
+    };
+    fs::create_dir(&dir).unwrap();
+    // Install a copy as in README option 2: root-owned, setuid, group nogroup, 4750.
+    let tmp = nix::unistd::mkdtemp("/tmp/sudoubt-test-XXXXXX").unwrap();
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
+    let bin = tmp.join("sudoubt");
+    fs::copy(BIN, &bin).unwrap();
+    nix::unistd::chown(&bin, Some(0.into()), Some(65534.into())).unwrap();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o4750)).unwrap();
+    let o = Command::new("setpriv")
+        .args(["--reuid=65534", "--regid=65534", "--clear-groups"])
+        .arg(&bin)
+        .args([
+            &dir,
+            "--chmod",
+            "2750",
+            "--setfacl",
+            "u::rwx,g::r-x,o::-,g:6000:r-x",
+        ])
+        .env("LD_PRELOAD", "/nonexistent.so")
+        .output()
+        .unwrap();
+    fs::remove_dir_all(&tmp).unwrap();
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{stdout} {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(mode(&dir), 0o2750);
+    let o = run(&[&dir, "--getfacl"]);
+    assert_eq!(
+        o.json["results"]["getfacl"]["access"],
+        "u::rwx,g::r-x,g:6000:r-x,m::r-x,o::---"
+    );
+}
+
+#[test]
+fn mount_points_are_refused() {
+    let Some((_g, dir)) = setup("mount") else {
+        return;
+    };
+    let mnt = format!("{dir}/mnt");
+    fs::create_dir_all(&mnt).unwrap();
+    let ok = Command::new("mount")
+        .args(["-t", "tmpfs", "tmpfs", &mnt])
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "mount failed");
+    let a = run(&[&mnt, "--chmod", "0777"]);
+    let b = run(&[&format!("{mnt}/x"), "--mkdir"]);
+    Command::new("umount").arg(&mnt).status().unwrap();
+    assert_eq!(a.code, 3, "{}", a.json);
+    assert_eq!(b.code, 3, "{}", b.json);
+}
+
+#[test]
+fn snap_is_refused() {
+    let Some((_g, dir)) = setup("snap") else {
+        return;
+    };
+    fs::create_dir(&dir).unwrap();
+    assert_eq!(run(&[&format!("{dir}/.snap/keep"), "--mkdir"]).code, 3);
+}
+
+#[test]
 fn read_only_calls_skip_the_rate_limit() {
     let Some((_g, dir)) = setup("readonly") else {
         return;

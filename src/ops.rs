@@ -13,7 +13,7 @@ use xattr::FileExt;
 use crate::acl::{build, resolve, to_text};
 use crate::path::{open_parent, open_target};
 use crate::request::{Request, check_owner_id, resolve_group, resolve_user};
-use crate::{EXIT_FS, Fail, Result};
+use crate::{EXIT_FS, EXIT_PATH, Fail, Result};
 
 /// The kernel's name for the default ACL. Used only to remove it.
 const DEFAULT_ACL_XATTR: &str = "system.posix_acl_default";
@@ -52,7 +52,7 @@ pub fn run(req: &Request, results: &mut Map<String, Value>) -> Result<()> {
         .as_str();
 
     let mkdir = if req.mkdir {
-        match mkdirat(&parent, name, Mode::from_bits_truncate(0o700)) {
+        match mkdirat(&parent.fd, name, Mode::from_bits_truncate(0o700)) {
             Ok(()) => Some("created"),
             Err(Errno::EEXIST) => Some("exists"),
             Err(e) => return Err(fs_error("mkdir", e.desc())),
@@ -60,7 +60,16 @@ pub fn run(req: &Request, results: &mut Map<String, Value>) -> Result<()> {
     } else {
         None
     };
-    let dir = open_target(&parent, name)?;
+    let (dir, st) = open_target(&parent, name)?;
+    // mkdir made a root-owned directory with no group or other bits (mode 0700
+    // or less with a default ACL, plus setgid inherited from the parent).
+    // Anything else means a project member replaced it before it was opened.
+    if mkdir == Some("created") && (st.st_uid != 0 || st.st_mode & 0o5077 != 0) {
+        return Err(Fail::new(
+            EXIT_PATH,
+            "the new directory was replaced before it was opened",
+        ));
+    }
     if let Some(r) = mkdir {
         results.insert("mkdir".into(), json!(r));
     }
