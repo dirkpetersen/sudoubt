@@ -71,6 +71,9 @@ fn main() -> ExitCode {
         format!("uid {ruid}")
     };
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    // Close every file the caller passed on beyond stdin, stdout and stderr,
+    // so they cannot use up the file limit. SAFETY: no fds are open yet.
+    unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) };
     // Rust's runtime has already reopened closed fds 0 to 2 on /dev/null, so
     // no file opened below can land on stdout or stderr.
     // SAFETY: no other threads exist yet.
@@ -94,6 +97,7 @@ fn main() -> ExitCode {
         Err(f) => format!("exit={} error={:?}", f.code, f.msg),
     };
     let (path_log, ops_log) = (clip(&format!("{path:?}")), clip(&format!("{ops:?}")));
+    let result = clip(&result);
     log(&format!(
         "caller={caller:?} path={path_log} ops={ops_log} result={result}"
     ));

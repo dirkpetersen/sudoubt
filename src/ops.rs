@@ -60,21 +60,37 @@ pub fn run(req: &Request, results: &mut Map<String, Value>) -> Result<()> {
     } else {
         None
     };
-    let (dir, st) = open_target(&parent, name)?;
-    // mkdir made a root-owned directory with no group or other bits (mode 0700
-    // or less with a default ACL, plus setgid inherited from the parent).
-    // Anything else means a project member replaced it before it was opened.
-    if mkdir == Some("created") && (st.st_uid != 0 || st.st_mode & 0o5077 != 0) {
-        return Err(Fail::new(
-            EXIT_PATH,
-            "the new directory was replaced before it was opened",
-        ));
-    }
+    // Report the mkdir at once: if a later check fails, it still happened.
     if let Some(r) = mkdir {
         results.insert("mkdir".into(), json!(r));
     }
+    let created = mkdir == Some("created");
+    let replaced = || {
+        Fail::new(
+            EXIT_PATH,
+            "the new directory was replaced before it was opened",
+        )
+    };
+    let (dir, st) = match open_target(&parent, name) {
+        Ok(t) => t,
+        Err(_) if created => return Err(replaced()),
+        Err(f) => return Err(f),
+    };
     // libacl works on paths. This magic link always resolves to the opened directory.
     let proc_path = format!("/proc/self/fd/{}", dir.as_raw_fd());
+    // mkdir made an empty root-owned directory with no group or other bits
+    // (0700 or less with a default ACL, plus setgid inherited from the
+    // parent). Only root can make one, and nobody else can put anything in
+    // it, so anything else means a project member swapped in another
+    // directory before it was opened.
+    if created {
+        let empty = std::fs::read_dir(&proc_path)
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(false);
+        if st.st_uid != 0 || st.st_mode & 0o5077 != 0 || !empty {
+            return Err(replaced());
+        }
+    }
 
     if let Some((text, uid, gid)) = owner {
         fchown(dir.as_fd(), Some(uid), Some(gid)).map_err(|e| fs_error("chown", e.desc()))?;

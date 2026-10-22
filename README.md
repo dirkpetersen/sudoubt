@@ -142,7 +142,7 @@ Success:
 }
 ```
 
-`mkdir` is `"created"` or `"exists"`. Read operations put their data in `results`:
+`mkdir` is `"created"` or `"exists"`. For the write operations, `results` repeats what was requested, not the state afterwards: for example `--chmod 2770 --setfacl u::rwx,g::rwx,o::rwx` reports `"chmod": "2770"`, but the setfacl then changes the mode to `2777`. Use `--getfacl` to read the result. Read operations put their data in `results`:
 
 - `"getfacl": {"access": "u::rwx,g::rwx,m::rwx,o::---", "default": "d:u::rwx,d:g::rwx,d:o::---"}`. The text uses numeric IDs and the same syntax as `--setfacl`. `default` is `null` if there is no default ACL.
 - `"getfattr": {"ceph.quota.max_bytes": "10995116277760"}`. The value is `null` if the attribute is not set.
@@ -163,7 +163,7 @@ Failure:
 
 On exit code 5, `results` holds the operations that completed before the failure.
 
-One exception to "did nothing": if `--mkdir` creates the directory and someone with write access to the parent replaces it before sudoubt opens it, the call fails with exit code 3 and the directory was created. sudoubt detects the swap because only root can make a root-owned directory with no group or other permissions.
+One exception to "did nothing": if `--mkdir` creates the directory and someone with write access to the parent replaces it before sudoubt opens it, the call fails with exit code 3 and the directory was created. sudoubt detects the swap: the directory it opens must be empty, owned by root and have no group or other permissions, and only root can make such a directory. If the new directory disappears or turns into something else before sudoubt opens it, the call fails with exit code 3 too, and `results` shows `"mkdir": "created"`.
 
 ### Group-writable parent directories
 
@@ -203,7 +203,9 @@ sudoubt works only on paths inside one of these roots. It refuses:
 - an allowed root itself (for example `/storage/test`), so the caller cannot change the owner or mode of the root,
 - paths that go through a symlink (see below), including symlinks in the allowed root itself,
 - paths that cross a mount point below the allowed root,
-- paths with a `.snap` component (on CephFS, mkdir there creates a snapshot).
+- paths with a `.snap` component, and any directory that has the same inode as its parent (on CephFS the snapshot directory looks like that, whatever `snapdirname` is set to; mkdir there creates a snapshot).
+
+The allowed root and every directory above it must be owned by root and not writable by group or others (unless the sticky bit is set). Otherwise every call fails with exit code 3, because someone else could rename the root away and replace it.
 
 ## Rate limit
 
@@ -293,7 +295,13 @@ git tag v0.0.1
 git push origin v0.0.1
 ```
 
-`.github/workflows/release.yml` then tests and builds on x86_64 and arm64 and publishes `sudoubt-0.0.1-linux-x86_64.tar.gz` and `sudoubt-0.0.1-linux-arm64.tar.gz`, each with a `.sha256` file. The build runs on Ubuntu 24.04 (glibc 2.39), so the binaries run on RHEL 10 and Ubuntu 26.04.
+The tag must point to a commit on `main`, and only repository admins can create `v*` tags (a repository ruleset). `.github/workflows/release.yml` then runs all tests, including the root tests, and builds on x86_64 and arm64 and publishes `sudoubt-0.0.1-linux-x86_64.tar.gz` and `sudoubt-0.0.1-linux-arm64.tar.gz`, each with a `.sha256` file and a signed build provenance attestation. Check a download with:
+
+```bash
+gh attestation verify sudoubt-0.0.1-linux-x86_64.tar.gz --repo dirkpetersen/sudoubt
+```
+
+The build runs on Ubuntu 24.04 (glibc 2.39), so the binaries run on RHEL 10 and Ubuntu 26.04.
 
 ## License
 

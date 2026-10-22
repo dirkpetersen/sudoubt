@@ -1,16 +1,16 @@
 //! Path rules and safe path resolution.
 //!
 //! `check` decides from the string alone whether a path is allowed.
-//! `open_parent` and `open_target` walk it from `/` one component at a time
-//! with `O_NOFOLLOW`, so a symlink cannot redirect them. sudoubt works on
-//! directories only.
+//! `open_parent` and `open_target` walk it from `/` one component at a time,
+//! so neither a symlink nor a mount point can redirect them. sudoubt works
+//! on directories only.
 
 use std::ffi::OsStr;
 use std::fs::File;
 use std::os::fd::OwnedFd;
 
 use nix::errno::Errno;
-use nix::fcntl::{OFlag, open, openat};
+use nix::fcntl::{OFlag, OpenHow, ResolveFlag, open, openat, openat2};
 use nix::sys::stat::{FileStat, Mode, SFlag, fstat};
 
 use crate::{ALLOWED_ROOTS, EXIT_FS, EXIT_PATH, Fail, Result};
@@ -70,15 +70,45 @@ pub fn check(path: &OsStr) -> Result<(&'static str, Vec<String>)> {
     Err(refused("path is outside the allowed roots"))
 }
 
-/// The directory that holds the target, and the device of the allowed root.
+/// The directory that holds the target, with its status, and the device of
+/// the allowed root.
 pub struct Parent {
     pub fd: OwnedFd,
+    pub st: FileStat,
     pub dev: u64,
 }
 
-/// Open the directory that holds the target. Every component from `/` down,
-/// including the allowed root itself, must be a real directory, not a
-/// symlink. Components below the root must be on the root's file system.
+/// How components below the allowed root are opened: never through a
+/// symlink, never across a mount point (refused during lookup, before
+/// anything on the other file system is touched), never above `dirfd`.
+fn below_root(flags: OFlag) -> OpenHow {
+    OpenHow::new().flags(flags | OFlag::O_CLOEXEC).resolve(
+        ResolveFlag::RESOLVE_BENEATH
+            | ResolveFlag::RESOLVE_NO_SYMLINKS
+            | ResolveFlag::RESOLVE_NO_XDEV
+            | ResolveFlag::RESOLVE_NO_MAGICLINKS,
+    )
+}
+
+/// Map an open error below the root to an exit code.
+fn open_error(c: &str, e: Errno) -> Fail {
+    match e {
+        Errno::ENOENT => Fail::new(EXIT_FS, format!("{c:?} does not exist")),
+        Errno::ELOOP => refused("path goes through or is a symlink"),
+        Errno::EXDEV => refused("path crosses a mount point below the allowed root"),
+        Errno::ENOTDIR => refused(format!("{c:?} is not a directory")),
+        e => fs_error(&format!("cannot open {c:?}"), e),
+    }
+}
+
+/// Open the directory that holds the target.
+///
+/// The allowed root and its ancestors are opened one component at a time
+/// with `O_NOFOLLOW` from `/`; each must be a real directory owned by root
+/// and not writable by others (unless sticky), so nobody but root can swap
+/// the root. Components below the root are opened one at a time with
+/// `openat2` and the flags in `below_root`. A component with the same inode
+/// as its parent (a snapshot directory such as CephFS `.snap`) is refused.
 pub fn open_parent(root: &str, rel: &[String]) -> Result<Parent> {
     let mut dir = open(
         "/",
@@ -86,61 +116,84 @@ pub fn open_parent(root: &str, rel: &[String]) -> Result<Parent> {
         Mode::empty(),
     )
     .map_err(|e| fs_error("cannot open /", e))?;
-    let root_comps: Vec<&str> = root[1..].split('/').collect();
-    let n_root = root_comps.len();
-    let rel_comps = rel[..rel.len() - 1].iter().map(String::as_str);
-    let mut dev = 0;
-    for (i, c) in root_comps.into_iter().chain(rel_comps).enumerate() {
-        let fd = match openat(
+    let mut st = fstat(&dir).map_err(|e| fs_error("cannot stat /", e))?;
+    check_trusted("/", &st)?;
+    for c in root[1..].split('/') {
+        let fd = openat(
             &dir,
             c,
             OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
             Mode::empty(),
-        ) {
-            Ok(fd) => fd,
-            Err(Errno::ENOENT) => return Err(Fail::new(EXIT_FS, format!("{c:?} does not exist"))),
-            Err(e) => return Err(fs_error(&format!("cannot open {c:?}"), e)),
-        };
-        let st = fstat(&fd).map_err(|e| fs_error(&format!("cannot stat {c:?}"), e))?;
+        )
+        .map_err(|e| fs_error(&format!("cannot open allowed root component {c:?}"), e))?;
+        st = fstat(&fd).map_err(|e| fs_error(&format!("cannot stat {c:?}"), e))?;
         match kind(&st) {
             SFlag::S_IFDIR => {}
-            SFlag::S_IFLNK => return Err(refused("path goes through a symlink")),
-            _ => {
-                return Err(refused(format!(
-                    "path goes through {c:?}, which is not a directory"
-                )));
-            }
+            SFlag::S_IFLNK => return Err(refused("the allowed root goes through a symlink")),
+            _ => return Err(refused("the allowed root is not a directory")),
         }
-        if i + 1 == n_root {
-            dev = st.st_dev;
-        } else if i >= n_root && st.st_dev != dev {
-            return Err(refused("path crosses a mount point below the allowed root"));
-        }
+        check_trusted(c, &st)?;
         dir = fd;
     }
-    Ok(Parent { fd: dir, dev })
+    let dev = st.st_dev;
+    for c in &rel[..rel.len() - 1] {
+        let fd = openat2(
+            &dir,
+            c.as_str(),
+            below_root(OFlag::O_PATH | OFlag::O_DIRECTORY),
+        )
+        .map_err(|e| open_error(c, e))?;
+        let st2 = fstat(&fd).map_err(|e| fs_error(&format!("cannot stat {c:?}"), e))?;
+        check_below(c, &st, &st2, dev)?;
+        dir = fd;
+        st = st2;
+    }
+    Ok(Parent { fd: dir, st, dev })
+}
+
+/// The allowed root and its ancestors: owned by root, not writable by group
+/// or others unless the sticky bit is set.
+fn check_trusted(c: &str, st: &FileStat) -> Result<()> {
+    if st.st_uid != 0 || (st.st_mode & 0o022 != 0 && st.st_mode & 0o1000 == 0) {
+        return Err(refused(format!(
+            "allowed root component {c:?} must be owned by root and not writable by others"
+        )));
+    }
+    Ok(())
+}
+
+/// A component below the root: a directory on the root's file system that
+/// is not a snapshot view of its parent.
+fn check_below(c: &str, parent: &FileStat, st: &FileStat, dev: u64) -> Result<()> {
+    if kind(st) != SFlag::S_IFDIR {
+        return Err(refused(format!("{c:?} is not a directory")));
+    }
+    if st.st_dev != dev {
+        return Err(refused("path crosses a mount point below the allowed root"));
+    }
+    if st.st_ino == parent.st_ino {
+        return Err(refused(format!("{c:?} is a snapshot directory")));
+    }
+    Ok(())
 }
 
 /// Open the last component in `parent` as a directory, read-only, for every
 /// operation. `O_DIRECTORY` makes the kernel refuse anything else before it
-/// opens it, so devices and FIFOs are never opened, and `O_NOFOLLOW` refuses
-/// a symlink. Returns the directory and its status.
+/// opens it, so devices and FIFOs are never opened. Returns the directory
+/// and its status.
 pub fn open_target(parent: &Parent, name: &str) -> Result<(File, FileStat)> {
-    let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
-    let fd = match openat(&parent.fd, name, flags, Mode::empty()) {
-        Ok(fd) => fd,
-        Err(Errno::ENOENT) => return Err(Fail::new(EXIT_FS, "path does not exist")),
-        Err(Errno::ELOOP) => return Err(refused("path is a symlink")),
-        Err(Errno::ENOTDIR) => return Err(refused("path is not a directory")),
-        Err(e) => return Err(fs_error("cannot open path", e)),
-    };
+    let fd = openat2(
+        &parent.fd,
+        name,
+        below_root(OFlag::O_RDONLY | OFlag::O_DIRECTORY),
+    )
+    .map_err(|e| match e {
+        Errno::ENOENT => Fail::new(EXIT_FS, "path does not exist"),
+        Errno::ENOTDIR => refused("path is not a directory"),
+        e => open_error(name, e),
+    })?;
     let st = fstat(&fd).map_err(|e| fs_error("cannot stat path", e))?;
-    if kind(&st) != SFlag::S_IFDIR {
-        return Err(refused("path is not a directory"));
-    }
-    if st.st_dev != parent.dev {
-        return Err(refused("path is a mount point below the allowed root"));
-    }
+    check_below(name, &parent.st, &st, parent.dev)?;
     Ok((File::from(fd), st))
 }
 
@@ -193,6 +246,22 @@ mod tests {
         }
         assert_eq!(code(&format!("/storage/test/{}", "a".repeat(256))), 3);
         assert_eq!(code(&format!("/storage/test/{}", "a/".repeat(2100))), 3);
+    }
+
+    #[test]
+    fn roots_are_not_nested() {
+        for a in ALLOWED_ROOTS {
+            assert!(
+                a.starts_with('/') && !a.ends_with('/') && a.len() > 1,
+                "{a}"
+            );
+            for b in ALLOWED_ROOTS {
+                assert!(
+                    a == b || !b.starts_with(&format!("{a}/")),
+                    "{a} contains {b}"
+                );
+            }
+        }
     }
 
     #[test]

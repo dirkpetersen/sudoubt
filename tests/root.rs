@@ -401,6 +401,23 @@ fn mount_points_are_refused() {
 }
 
 #[test]
+fn writable_root_is_refused() {
+    let Some((_g, dir)) = setup("rootmode") else {
+        return;
+    };
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(ROOT, fs::Permissions::from_mode(0o777)).unwrap();
+    let o = run(&[&dir, "--chmod", "0700"]);
+    fs::set_permissions(ROOT, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(o.code, 3, "{}", o.json);
+    // With the sticky bit, others cannot rename the root's entries.
+    fs::set_permissions(ROOT, fs::Permissions::from_mode(0o1777)).unwrap();
+    let o = run(&[&dir, "--chmod", "0700"]);
+    fs::set_permissions(ROOT, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(o.code, 0, "{}", o.json);
+}
+
+#[test]
 fn snap_is_refused() {
     let Some((_g, dir)) = setup("snap") else {
         return;
