@@ -54,6 +54,8 @@ Install the binary owned by root, and give the web server user one sudoers rule 
 sudo install -o root -g root -m 0700 sudoubt /usr/local/bin/sudoubt
 ```
 
+The binary needs the libacl shared library at run time (`libacl` on RHEL, `libacl1` on Ubuntu). Both are installed by default.
+
 ```sudoers
 # /etc/sudoers.d/projectvault
 projectvault ALL=(root) NOPASSWD: /usr/local/bin/sudoubt
@@ -203,7 +205,7 @@ sudoubt works only on paths inside one of these roots. It refuses:
 - an allowed root itself (for example `/storage/test`), so the caller cannot change the owner or mode of the root,
 - paths that go through a symlink (see below), including symlinks in the allowed root itself,
 - paths that cross a mount point below the allowed root,
-- paths with a `.snap` component, and any directory that has the same inode as its parent (on CephFS the snapshot directory looks like that, whatever `snapdirname` is set to; mkdir there creates a snapshot).
+- paths with a `.snap` component, and any directory that has the same inode as its parent. With the CephFS kernel client the snapshot directory looks like that, whatever `snapdirname` is set to; mkdir there creates a snapshot. ceph-fuse reports other inode numbers, so with ceph-fuse keep the default snapshot directory name `.snap`.
 
 The allowed root and every directory above it must be owned by root and not writable by group or others (unless the sticky bit is set). Otherwise every call fails with exit code 3, because someone else could rename the root away and replace it.
 
@@ -248,7 +250,7 @@ The caller is the `SUDO_USER` that sudo sets in sudo mode, and the real UID in s
 | 7    | Not running as root (effective UID is not 0). |
 | 8    | Too many waiting: 25 write calls already wait for the rate limit. |
 
-For codes 2, 3, 4, 6, 7 and 8 sudoubt did nothing, except for the `--mkdir` race described under [Output](#output). For code 5, the operations before the failed one are complete.
+For codes 2, 3, 4, 6, 7 and 8 sudoubt did nothing, except for the `--mkdir` race described under [Output](#output). `results` can still show `"mkdir": "exists"` with exit code 3, for example when the path is an existing file; nothing was changed then. For code 5, the operations before the failed one are complete.
 
 ## Security model
 
@@ -295,7 +297,7 @@ git tag v0.0.1
 git push origin v0.0.1
 ```
 
-The tag must point to a commit on `main`, and only repository admins can create `v*` tags (a repository ruleset). `.github/workflows/release.yml` then runs all tests, including the root tests, and builds on x86_64 and arm64 and publishes `sudoubt-0.0.1-linux-x86_64.tar.gz` and `sudoubt-0.0.1-linux-arm64.tar.gz`, each with a `.sha256` file and a signed build provenance attestation. Check a download with:
+The tag must point to a commit on `main`, and only repository admins can create `v*` tags (a repository ruleset). `.github/workflows/release.yml` then runs all tests, including the root tests, and builds on x86_64 and arm64 and publishes `sudoubt-0.0.1-linux-x86_64.tar.gz` and `sudoubt-0.0.1-linux-arm64.tar.gz`, each with a `.sha256` file and a signed build provenance attestation. The job that compiles and tests has read-only access; a separate job that runs no third-party code attests and uploads the tarballs. Check a download with:
 
 ```bash
 gh attestation verify sudoubt-0.0.1-linux-x86_64.tar.gz --repo dirkpetersen/sudoubt

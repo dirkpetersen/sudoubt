@@ -29,6 +29,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes
 
+  # Compiles and runs third-party code, so it gets no write access.
   build:
     needs: draft
     strategy:
@@ -41,9 +42,7 @@ jobs:
     # ubuntu-24.04 links against glibc 2.39, so the binary runs on RHEL 10 and Ubuntu 26.04+
     runs-on: ${{ matrix.runner }}
     permissions:
-      contents: write
-      id-token: write
-      attestations: write
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the Rust toolchain from rust-toolchain.toml
@@ -57,31 +56,39 @@ jobs:
       - name: Build
         run: cargo build --locked --release
       - name: Package
-        id: package
         run: |
           name="sudoubt-${GITHUB_REF_NAME#v}-linux-${{ matrix.arch }}"
-          mkdir "$name"
+          mkdir -p "$name" dist
           cp target/release/sudoubt README.md LICENSE "$name/"
-          tar czf "$name.tar.gz" "$name"
-          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
-          echo "name=$name" >> "$GITHUB_OUTPUT"
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+          tar czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          subject-path: ${{ steps.package.outputs.name }}.tar.gz
-      - name: Upload
-        env:
-          GH_TOKEN: ${{ github.token }}
-          NAME: ${{ steps.package.outputs.name }}
-        run: gh release upload "$GITHUB_REF_NAME" "$NAME.tar.gz" "$NAME.tar.gz.sha256"
+          name: dist-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
 
+  # Runs no third-party code: attests the tarballs and uploads them.
   publish:
     needs: build
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
-      - name: Publish release
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+      - name: Upload and publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+        run: |
+          gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY"
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false

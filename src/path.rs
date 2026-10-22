@@ -17,6 +17,8 @@ use crate::{ALLOWED_ROOTS, EXIT_FS, EXIT_PATH, Fail, Result};
 
 const MAX_PATH: usize = 4096;
 const MAX_NAME: usize = 255;
+/// The message when the target does not exist.
+pub const NOT_FOUND: &str = "path does not exist";
 
 fn refused(msg: impl Into<String>) -> Fail {
     Fail::new(EXIT_PATH, msg)
@@ -188,7 +190,7 @@ pub fn open_target(parent: &Parent, name: &str) -> Result<(File, FileStat)> {
         below_root(OFlag::O_RDONLY | OFlag::O_DIRECTORY),
     )
     .map_err(|e| match e {
-        Errno::ENOENT => Fail::new(EXIT_FS, "path does not exist"),
+        Errno::ENOENT => Fail::new(EXIT_FS, NOT_FOUND),
         Errno::ENOTDIR => refused("path is not a directory"),
         e => open_error(name, e),
     })?;

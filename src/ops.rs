@@ -11,7 +11,7 @@ use serde_json::{Map, Value, json};
 use xattr::FileExt;
 
 use crate::acl::{build, resolve, to_text};
-use crate::path::{open_parent, open_target};
+use crate::path::{NOT_FOUND, open_parent, open_target};
 use crate::request::{Request, check_owner_id, resolve_group, resolve_user};
 use crate::{EXIT_FS, EXIT_PATH, Fail, Result};
 
@@ -73,7 +73,11 @@ pub fn run(req: &Request, results: &mut Map<String, Value>) -> Result<()> {
     };
     let (dir, st) = match open_target(&parent, name) {
         Ok(t) => t,
-        Err(_) if created => return Err(replaced()),
+        // Gone, or now a symlink or not a directory: someone swapped it.
+        // Other errors keep their own exit code and message.
+        Err(f) if created && (f.code == EXIT_PATH || f.msg == NOT_FOUND) => {
+            return Err(replaced());
+        }
         Err(f) => return Err(f),
     };
     // libacl works on paths. This magic link always resolves to the opened directory.
@@ -85,8 +89,9 @@ pub fn run(req: &Request, results: &mut Map<String, Value>) -> Result<()> {
     // directory before it was opened.
     if created {
         let empty = std::fs::read_dir(&proc_path)
-            .map(|mut d| d.next().is_none())
-            .unwrap_or(false);
+            .map_err(|e| fs_error("reading the new directory", e))?
+            .next()
+            .is_none();
         if st.st_uid != 0 || st.st_mode & 0o5077 != 0 || !empty {
             return Err(replaced());
         }
